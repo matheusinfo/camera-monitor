@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Corrigido: o historico de alertas sumia do painel ao reiniciar o container ou a Echo. Agora fica em `fotos/eventos.jsonl`, com data no horario.
 - Adicionado `DETECT_TILES`: analisa recortes do quadro para achar pessoa pequena ou atras de grade.
 - Foto e push do alerta usam o quadro analisado, nao o mais novo (em CPU lenta a caixa ficava no vazio).
 - Corrigido `/test`: o push de teste agora leva a foto.

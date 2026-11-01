@@ -387,7 +387,7 @@ deploy-pi.sh              Comando forcado do deploy automatico no Pi
 docker-entrypoint.sh      Inicializa MediaMTX e o servidor Python
 start-mediamtx-windows.ps1  Relay MediaMTX no host Windows, so para WSL2
 .env.exemplo              Modelo de configuracao local
-fotos/                    Fotos privadas dos eventos
+fotos/                    Fotos privadas dos eventos e historico (eventos.jsonl)
 MobileNetSSD_deploy.*     Modelo MobileNet-SSD e configuracao Caffe
 ```
 

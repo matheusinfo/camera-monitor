@@ -59,6 +59,10 @@ CF_ACCESS_AUD = os.environ.get("CF_ACCESS_AUD", "")    # Application Audience (A
 NTFY_URL = os.environ.get("NTFY_URL", "")  # push no celular: https://ntfy.sh/<tópico-secreto>
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "")  # tocar no push abre o ao vivo
 FOTOS_DIR = "fotos"            # snapshot anotado de cada notificação
+# Histórico do painel junto das fotos, no mesmo volume: sobrevive a reiniciar o
+# container ou o aparelho (antes era só memória e o painel voltava vazio).
+EVENTS_FILE = os.path.join(FOTOS_DIR, "eventos.jsonl")
+EVENTS_MAX = 50
 # A detecção roda em thread própria sobre o frame mais recente, então o vídeo não
 # trava enquanto ela pensa (num Pi 3 uma análise custa ~2,5s). Estes dois são o
 # botão de CPU: pausa entre análises e threads do OpenCV (0 = todas).
@@ -117,12 +121,35 @@ app = Flask(__name__)
 state = {
     "jpeg": None,               # último frame anotado (bytes)
     "detections": [],           # detecções do último frame analisado
-    "events": deque(maxlen=50), # histórico de notificações
+    "events": deque(maxlen=EVENTS_MAX), # histórico de notificações
     "connected": False,
     "espectadores": 0,          # conexões abertas em /stream
     "last_notify": {},          # categoria -> timestamp
 }
 lock = threading.Lock()
+
+
+def load_events():
+    """Recarrega o histórico e corta o arquivo nos EVENTS_MAX mais recentes."""
+    try:
+        with open(EVENTS_FILE, encoding="utf-8") as f:
+            linhas = f.read().splitlines()[-EVENTS_MAX:]
+    except FileNotFoundError:
+        return
+    eventos = []
+    for linha in linhas:
+        try:
+            eventos.append(json.loads(linha))
+        except ValueError:
+            pass  # linha pela metade de um desligamento no meio da escrita
+    for ev in eventos:
+        state["events"].appendleft(ev)
+    with open(EVENTS_FILE + ".tmp", "w", encoding="utf-8") as f:
+        f.writelines(json.dumps(ev, ensure_ascii=False) + "\n" for ev in eventos)
+    os.replace(EVENTS_FILE + ".tmp", EVENTS_FILE)
+
+
+load_events()
 
 if CF_ACCESS_TEAM and CF_ACCESS_AUD:
     import jwt
@@ -478,11 +505,13 @@ def save_events(fired, frame, ts, dets):
         return
     stamp = time.localtime(ts)
     for ev in fired:
-        ev["time"] = time.strftime("%H:%M:%S", stamp)
+        ev["time"] = time.strftime("%d/%m %H:%M:%S", stamp)
         ev["photo"] = f"{time.strftime('%Y%m%d_%H%M%S', stamp)}_{ev.pop('cat')}.jpg"
         with open(os.path.join(FOTOS_DIR, ev["photo"]), "wb") as f:
             f.write(jpg.tobytes())
         phone_notify(ev["title"], ev["msg"], jpg.tobytes())
+    with open(EVENTS_FILE, "a", encoding="utf-8") as f:
+        f.writelines(json.dumps(ev, ensure_ascii=False) + "\n" for ev in fired)
     with lock:
         for ev in fired:
             state["events"].appendleft(ev)
