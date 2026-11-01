@@ -76,6 +76,9 @@ VIDEO_FPS = int(os.environ.get("VIDEO_FPS") or "8")
 # perder quem ficou imóvel.
 MOTION_BLOB = int(os.environ.get("MOTION_BLOB") or "40")
 MOTION_IDLE_S = 10
+# 1 = além do frame inteiro, analisa recortes (acha pessoa pequena ou atrás de
+# grade; custa ~15x mais CPU por análise). Deixe 0 no Raspberry Pi.
+DETECT_TILES = os.environ.get("DETECT_TILES", "0") == "1"
 # Pessoa atrás da grade do portão sai com 0,25-0,45 (barras cortam o corpo);
 # portão vazio não dá nada nem no piso do modelo, 0,25 (medido de dia no Pi,
 # 2026-10). Falso alarme à noite? Suba PESSOA_MIN. Animal fica alto: alucinação.
@@ -198,9 +201,11 @@ def desktop_notify(title: str, msg: str) -> None:
         pass
 
 
-def detect(frame):
-    h, w = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)),
+def detect_view(frame, x0, y0, size_w, size_h):
+    """Roda o MobileNet num recorte e devolve as caixas em coordenadas do frame."""
+    H, W = frame.shape[:2]
+    view = frame[y0:y0 + size_h, x0:x0 + size_w]
+    blob = cv2.dnn.blobFromImage(cv2.resize(view, (300, 300)),
                                  0.007843, (300, 300), 127.5)
     net.setInput(blob)
     out = net.forward()
@@ -213,14 +218,36 @@ def detect(frame):
                   flush=True)
         if cls not in CATEGORY or conf < CONFIDENCE_MIN[CATEGORY[cls]]:
             continue
-        x1, y1, x2, y2 = out[0, 0, i, 3:7]
-        if CATEGORY[cls] == "animal" and (x2 - x1) * (y2 - y1) > MAX_ANIMAL_AREA:
+        box = out[0, 0, i, 3:7] * np.array([size_w, size_h, size_w, size_h])
+        box += np.array([x0, y0, x0, y0])
+        area = (box[2] - box[0]) * (box[3] - box[1]) / (W * H)
+        if CATEGORY[cls] == "animal" and area > MAX_ANIMAL_AREA:
             continue
-        box = out[0, 0, i, 3:7] * np.array([w, h, w, h])
         found.append({"label": LABELS_PT[cls], "category": CATEGORY[cls],
                       "confidence": round(conf, 2),
                       "box": box.astype(int).tolist()})
     return found
+
+
+def detect(frame):
+    h, w = frame.shape[:2]
+    found = detect_view(frame, 0, 0, w, h)
+    if not DETECT_TILES:
+        return found
+    # Pessoa pequena, atrás de grade ou cruzando rápido some quando o frame
+    # inteiro é espremido em 300x300: reanalisa recortes quadrados (metade da
+    # altura) com sobreposição, que dão ao modelo a pessoa em tamanho útil.
+    side = h // 2
+    for y0 in (0, h - side):
+        for x0 in range(0, w - side + 1, side // 2):
+            found += detect_view(frame, x0, y0, side, side)
+    found.sort(key=lambda d: -d["confidence"])
+    unique = []
+    for d in found:  # a mesma pessoa aparece em vários recortes
+        if not any(u["category"] == d["category"] and iou(u["box"], d["box"]) > 0.4
+                   for u in unique):
+            unique.append(d)
+    return unique
 
 
 def iou(a, b):
@@ -423,8 +450,42 @@ def y4m_frames(stream):
         yield np.frombuffer(data, np.uint8).reshape(h * 3 // 2, w)
 
 
-detect_slot = {"frame": None, "dets": [], "fired": []}
+detect_slot = {"frame": None, "ts": 0.0, "dets": []}
 detect_ready = threading.Event()
+
+
+def draw_dets(frame, dets):
+    for d in dets:
+        x1, y1, x2, y2 = d["box"]
+        color = BOX_COLOR[d["category"]]
+        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(frame, f'{d["label"]} {int(d["confidence"]*100)}%',
+                    (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, color, 2)
+
+
+def save_events(fired, frame, ts, dets):
+    """Foto e push com o quadro que foi analisado, não com o mais novo.
+
+    Em CPU lenta (Echo Show: segundos por análise) o quadro do momento em que a
+    análise termina já não tem a pessoa, e a caixa ficava no vazio."""
+    if not fired:
+        return
+    photo = frame.copy()
+    draw_dets(photo, dets)
+    ok, jpg = cv2.imencode(".jpg", photo, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    if not ok:
+        return
+    stamp = time.localtime(ts)
+    for ev in fired:
+        ev["time"] = time.strftime("%H:%M:%S", stamp)
+        ev["photo"] = f"{time.strftime('%Y%m%d_%H%M%S', stamp)}_{ev.pop('cat')}.jpg"
+        with open(os.path.join(FOTOS_DIR, ev["photo"]), "wb") as f:
+            f.write(jpg.tobytes())
+        phone_notify(ev["title"], ev["msg"], jpg.tobytes())
+    with lock:
+        for ev in fired:
+            state["events"].appendleft(ev)
 
 
 def motion_thumb(frame):
@@ -456,7 +517,7 @@ def detect_loop():
         detect_ready.wait()
         detect_ready.clear()
         with lock:
-            frame = detect_slot["frame"]
+            frame, ts = detect_slot["frame"], detect_slot["ts"]
         thumb = motion_thumb(frame)
         if not moved(ref, thumb) and time.time() - last_run < MOTION_IDLE_S:
             continue  # cena parada: não gasta o MobileNet
@@ -465,7 +526,7 @@ def detect_loop():
         fired = maybe_notify(dets)  # sempre, para zerar streaks quando a cena esvazia
         with lock:
             detect_slot["dets"] = dets
-            detect_slot["fired"] += fired
+        save_events(fired, frame, ts, dets)
         time.sleep(DETECT_INTERVAL_S)
 
 
@@ -507,33 +568,19 @@ def capture_loop():
         saude["ultimo_quadro"] = time.time()
         with lock:
             detect_slot["frame"] = frame.copy()  # o desenho abaixo não vaza pro detector
-            dets, fired = detect_slot["dets"], detect_slot["fired"]
-            detect_slot["fired"] = []
+            detect_slot["ts"] = time.time()
+            dets = detect_slot["dets"]
         detect_ready.set()
-        if not fired and not state["espectadores"]:
+        if not state["espectadores"]:
             with lock:
                 state["detections"] = dets
-            continue  # ninguém vendo: sem desenho nem JPEG
-        for d in dets:
-            x1, y1, x2, y2 = d["box"]
-            color = BOX_COLOR[d["category"]]
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, f'{d["label"]} {int(d["confidence"]*100)}%',
-                        (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.6, color, 2)
+            continue  # ninguém vendo: sem desenho nem JPEG (a foto do alerta sai do detect_loop)
+        draw_dets(frame, dets)
         ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
-            for ev in fired:  # foto já com as caixas desenhadas
-                ev["photo"] = f"{time.strftime('%Y%m%d_%H%M%S')}_{ev.pop('cat')}.jpg"
-                with open(os.path.join(FOTOS_DIR, ev["photo"]), "wb") as f:
-                    f.write(jpg.tobytes())
-                phone_notify(ev["title"], ev["msg"], jpg.tobytes())
             with lock:
                 state["jpeg"] = jpg.tobytes()
                 state["detections"] = dets
-                for ev in fired:
-                    state["events"].appendleft(ev)
-            fired = []
 
 
 # ------------------------------------------------------------ áudio
@@ -729,13 +776,17 @@ def status():
 @app.route("/test")
 def test():
     """Simula uma notificação (testa bipe/PiP/toast sem a câmera)."""
-    fotos = sorted(os.listdir(FOTOS_DIR))
+    fotos = sorted(f for f in os.listdir(FOTOS_DIR) if f.endswith(".jpg"))
     ev = {"time": time.strftime("%H:%M:%S"), "title": "Teste!",
           "msg": "Notificação simulada.", "photo": fotos[-1] if fotos else None}
     desktop_notify("Teste", ev["msg"])
-    phone_notify("Teste", ev["msg"])
     with lock:
+        jpg = state["jpeg"]
         state["events"].appendleft(ev)
+    if jpg is None and ev["photo"]:
+        with open(os.path.join(FOTOS_DIR, ev["photo"]), "rb") as f:
+            jpg = f.read()
+    phone_notify("Teste", ev["msg"], jpg)
     return "ok, notificação simulada"
 
 

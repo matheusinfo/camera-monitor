@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Adicionado `DETECT_TILES`: analisa recortes do quadro para achar pessoa pequena ou atras de grade.
+- Foto e push do alerta usam o quadro analisado, nao o mais novo (em CPU lenta a caixa ficava no vazio).
+- Corrigido `/test`: o push de teste agora leva a foto.
 - Push no ntfy quando o video para por 1 min, quando volta, e quando o watchdog reinicia o FFmpeg 3+ vezes em 10 min.
 - Container do Pi em `America/Sao_Paulo`: hora das notificacoes e nome das fotos saiam em UTC (3 h a frente).
 - Watchdog tambem reinicia o FFmpeg com mais de 64 KB parados no socket: atrasado, o lado dele seguia ESTABLISHED e o painel travava.

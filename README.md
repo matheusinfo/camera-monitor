@@ -86,6 +86,7 @@ Variaveis opcionais:
 | `DETECT_INTERVAL_S` | `0.4` | Pausa minima entre duas analises |
 | `VIDEO_FPS` | `8` | Quadros/s entregues pelo FFmpeg (4 no Pi); menos = menos CPU no video, sem afetar a deteccao |
 | `MOTION_BLOB` | `40` | Maior mancha de movimento (px, miniatura 160x90) para rodar o MobileNet; ignora chuva; `0` analisa sempre |
+| `DETECT_TILES` | `0` | `1` tambem analisa recortes do quadro: acha pessoa pequena ou atras de grade, com ~13x mais CPU. Mantenha `0` no Pi |
 | `WINDOWS_HOST` | vazio | So para WSL2, com `compose.wsl.yaml` |
 
 O arquivo `.env` e ignorado pelo Git. Nunca coloque credenciais diretamente em `compose.yaml`, no codigo ou em commits.
