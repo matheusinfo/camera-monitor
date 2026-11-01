@@ -1,0 +1,12 @@
+# Echo Show (techo5): imagem de 64 bits sobre camera-monitor-deps:arm64, que o
+# echo-deps.sh monta. Sem RUN de proposito: no Docker armhf da Echo o builder
+# classico nao aplica o seccomp-echo.json, e qualquer RUN arm64 morre com SIGSYS.
+FROM camera-monitor-deps:arm64
+
+WORKDIR /app
+COPY server.py config.py ptz.py gunicorn.conf.py MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel ./
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+EXPOSE 8090
+# Via sh: sem RUN nao da para dar chmod +x no entrypoint.
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/docker-entrypoint.sh"]

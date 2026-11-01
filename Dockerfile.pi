@@ -4,8 +4,11 @@ FROM debian:bookworm-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+# Tambem serve para a Echo Show com techo5 (userland armhf). Sandbox do apt como
+# root: o kernel Android dela tem CONFIG_ANDROID_PARANOID_NETWORK, que so deixa
+# root ou o grupo 3003 abrir sockets, e o usuario _apt fica sem DNS.
+RUN apt-get -o APT::Sandbox::User=root update \
+    && apt-get -o APT::Sandbox::User=root install -y --no-install-recommends ffmpeg ca-certificates curl \
        python3 python3-numpy python3-opencv python3-flask python3-jwt python3-cryptography gunicorn \
     && rm -rf /var/lib/apt/lists/*
 

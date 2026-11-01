@@ -1,0 +1,61 @@
+# Echo Show 5 com techo5. Tudo roda no aparelho, em /data/camera-monitor (a raiz
+# e somente leitura). Primeira vez, e quando mudar requirements-docker.txt:
+#   sh echo-deps.sh
+# Depois, para subir/atualizar:
+#   docker compose -f compose.echo.yaml --profile tunnel up -d --build
+#
+# - Kernel aarch64, mas userland e Docker armhf. O app roda em 64 bits (opencv do
+#   PyPI com NEON, ~5x mais rapido que o do Debian armhf); ver echo-deps.sh e o
+#   seccomp-echo.json, sem o qual o container arm64 morre com SIGSYS.
+# - Substream 640x360 (o H265 1080p nao decodifica em tempo real nos A53) e
+#   deteccao em 1 thread (~0,7 s por analise). Com 2 (~0,4 s) o worker do
+#   OpenCV fica em nice 0, disputando CPU com o video, e o video chegou a
+#   congelar por ~3 min. DETECT_TILES=1 multiplica a analise por ~13. Aqui eles
+#   sobrepoem o .env.
+# - O firewall do techo5 recusa portas publicadas vindas do Wi-Fi (a menos que
+#   DOCKER_LAN=1 em /data/penguin/settings.conf). A 8090 fica so no loopback;
+#   de fora o acesso e pelo cloudflared.
+# - O dockerd sobe no boot pelo supervisor do techo5; restart: unless-stopped
+#   traz os containers de volta depois de reiniciar a Echo.
+# - Kernel Android (CONFIG_ANDROID_PARANOID_NETWORK): fora do root, so o grupo
+#   3003 (AID_INET) abre sockets.
+services:
+  camera-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.echo
+    restart: unless-stopped
+    security_opt:
+      - seccomp=./seccomp-echo.json
+    env_file: .env
+    environment:
+      # Horario de Brasilia sem depender do tzdata (sem horario de verao desde 2019).
+      TZ: "<-03>3"
+      CAM_PATH: onvif2
+      DETECT_THREADS: "1"
+      DETECT_INTERVAL_S: "0.3"
+      DETECT_TILES: "0"
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - ./fotos:/app/fotos
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/healthz')"]
+      interval: 30s
+      timeout: 10s
+      retries: 6
+      start_period: 60s
+
+  cloudflared:
+    # A imagem oficial nao tem armhf: build local com o binario armhf.
+    build:
+      context: .
+      dockerfile: Dockerfile.cloudflared
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    # A imagem roda como nonroot: precisa do grupo 3003 para abrir sockets.
+    group_add: ["3003"]
+    depends_on:
+      camera-monitor:
+        condition: service_healthy
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}

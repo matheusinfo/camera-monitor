@@ -1,0 +1,14 @@
+# cloudflared para a Echo Show (techo5). A imagem oficial so tem amd64/arm64 e o
+# Docker da Echo e armhf (linux/arm/v7); rodar a arm64 la morre com SIGSYS no
+# seccomp. A Cloudflare publica o binario armhf nos releases do GitHub.
+FROM alpine:3.20
+
+ARG CLOUDFLARED_VERSION=2026.9.1
+RUN apk add --no-cache ca-certificates \
+    && wget -q -O /usr/local/bin/cloudflared \
+       "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-armhf" \
+    && chmod +x /usr/local/bin/cloudflared \
+    && /usr/local/bin/cloudflared --version
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/cloudflared"]
