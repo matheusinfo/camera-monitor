@@ -9,6 +9,11 @@
 [![MediaMTX](https://img.shields.io/badge/RTSP-MediaMTX-111827)](https://github.com/bluenviron/mediamtx)
 [![CI](https://github.com/plugato/camera-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/plugato/camera-monitor/actions/workflows/ci.yml)
 
+> **Fork** de [plugato/camera-monitor](https://github.com/plugato/camera-monitor), o
+> projeto principal. Este fork acrescenta o deploy numa
+> [Echo Show 5 com techo5](#rodando-numa-echo-show-5-techo5) e o historico de
+> alertas persistente; o resto acompanha o upstream.
+
 **Documentacao:** [seguranca](SECURITY.md) · [como contribuir](CONTRIBUTING.md) · [changelog](CHANGELOG.md)
 
 O Camera Monitor transforma o stream RTSP da camera em um painel web pratico para acompanhar a cena, ouvir o audio, receber notificacoes e mover uma camera PTZ.
@@ -27,6 +32,7 @@ O Camera Monitor transforma o stream RTSP da camera em um painel web pratico par
 - Protege o painel com usuario e senha HTTP Basic.
 - Pode publicar o painel por um Cloudflare Tunnel dentro do Docker.
 - Roda sozinho num Raspberry Pi 3 na rede da camera, sem PC ligado.
+- Roda numa Echo Show 5 com techo5 (Debian armhf com Docker), tambem sem PC ligado.
 
 ## Arquitetura
 
@@ -229,6 +235,84 @@ O `.env` do Pi fica no secret `PI_ENV_FILE` (conteudo inteiro do arquivo) e vai 
 
 A aplicacao exige `APP_USER` e `APP_PASS`, ou, atras do Cloudflare Access, `CF_ACCESS_TEAM` e `CF_ACCESS_AUD`: ai vale so o login do Access (o JWT de cada requisicao e validado) e nao ha segunda senha. O endpoint `/healthz` fica disponivel apenas para o healthcheck interno do Docker.
 
+### Rodando numa Echo Show 5 (techo5)
+
+Alternativa ao Pi: a Echo Show 5 (2a geracao, 2021) desbloqueada, com o techo5
+dando um userland Debian com Docker. Tudo roda no aparelho, em
+`/data/camera-monitor` (a raiz e somente leitura; `/data` sobrevive a
+reiniciar).
+
+O que muda em relacao ao Pi:
+
+- **64 bits sobre Docker 32 bits.** O kernel e aarch64, mas o Docker e armhf. O
+  OpenCV do Debian armhf vem sem NEON (~3,9 s por analise); o wheel aarch64 do
+  PyPI leva ~0,7 s com 1 thread. Por isso a imagem e arm64.
+- **`seccomp-echo.json`.** O perfil seccomp padrao do dockerd armhf so conhece a
+  ABI de 32 bits e o container arm64 morre com `SIGSYS`. O arquivo e o perfil
+  padrao do Docker com `SCMP_ARCH_AARCH64` como subarquitetura: mesmas regras
+  nas duas ABIs.
+- **Dependencias fora do `docker build`.** O builder classico nao aceita
+  `--security-opt`, entao nenhum `RUN` de 64 bits roda no build. O
+  `echo-deps.sh` monta a imagem base `camera-monitor-deps:arm64` (FFmpeg,
+  MediaMTX, numpy/OpenCV) por `docker run` + `docker commit`, e o
+  `Dockerfile.echo` so faz `COPY` do codigo.
+- **`cloudflared` armhf.** A imagem oficial nao tem armhf: o
+  `Dockerfile.cloudflared` baixa o binario armhf dos releases.
+- **Rede.** O kernel Android (`CONFIG_ANDROID_PARANOID_NETWORK`) so deixa root
+  ou o grupo `3003` abrir sockets: o `cloudflared` roda com `group_add: ["3003"]`
+  e o apt com o sandbox como root. O firewall do techo5 recusa portas publicadas
+  vindas do Wi-Fi (a menos que `DOCKER_LAN=1` em `/data/penguin/settings.conf`),
+  entao a `8090` fica so no loopback e o acesso de fora e pelo tunnel.
+- **CPU.** Substream `onvif2` (os A53 nao decodificam o H.265 1080p em tempo
+  real) e deteccao com 1 thread a cada 0,3 s: com 2 threads o worker do OpenCV
+  fica em nice 0 e o video chegou a congelar. `DETECT_TILES=1` multiplica a
+  analise por ~13.
+- **Persistencia.** `restart: unless-stopped` e o dockerd subindo pelo
+  supervisor do techo5 trazem os containers de volta depois de reiniciar a
+  Echo. Fotos e historico (`fotos/eventos.jsonl`) ficam em
+  `/data/camera-monitor/fotos`.
+
+`CAM_PATH`, `DETECT_THREADS`, `DETECT_INTERVAL_S`, `DETECT_TILES` e `TZ` ficam
+no `compose.echo.yaml` e sobrepoem o `.env`. No `.env`, alem das credenciais:
+
+```env
+CAM_AUDIO_PATH=onvif1
+CLOUDFLARE_TUNNEL_TOKEN=token-do-tunel
+CF_ACCESS_TEAM=<team>
+CF_ACCESS_AUD=<aud>
+NTFY_URL=https://ntfy.sh/<topico-secreto>
+PUBLIC_URL=https://camera.seudominio.com/
+```
+
+Copiar para a Echo (o SSH do techo5 entra como root; aqui com `Host echo` no
+`~/.ssh/config`):
+
+```bash
+tar -czf - Dockerfile.echo Dockerfile.cloudflared compose.echo.yaml echo-deps.sh \
+    seccomp-echo.json requirements-docker.txt server.py config.py ptz.py gunicorn.conf.py \
+    docker-entrypoint.sh MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel \
+  | ssh echo 'mkdir -p /data/camera-monitor/fotos && tar -C /data/camera-monitor -xzf -'
+```
+
+O `.env` vai a parte, uma vez (`chmod 600`). Na primeira vez, e quando mudar
+`requirements-docker.txt` ou a versao do MediaMTX, monte a imagem base:
+
+```bash
+ssh echo 'cd /data/camera-monitor && sh echo-deps.sh'
+```
+
+Depois, para subir ou atualizar (o aviso de plataforma `linux/arm64/v8` contra
+`linux/arm/v8` e esperado):
+
+```bash
+ssh echo 'cd /data/camera-monitor && docker compose -f compose.echo.yaml --profile tunnel up -d --build'
+```
+
+Sem o profile `tunnel` sobe so o monitor. No painel do Cloudflare Tunnel, o
+hostname aponta para `HTTP` `camera-monitor:8090`, como no `compose.yaml`. O
+deploy automatico do CI e so para o Pi; a Echo se atualiza com os comandos
+acima.
+
 ## Cloudflare Tunnel
 
 O servico `cloudflared` usa o token definido em `CLOUDFLARE_TUNNEL_TOKEN` e publica o destino interno `camera-monitor:8090`.
@@ -380,10 +464,15 @@ server.py                 Aplicacao Flask, stream, deteccao, audio e PTZ
 ptz.py                    Cliente ONVIF para movimento da camera
 Dockerfile                Imagem do monitor com FFmpeg e MediaMTX
 Dockerfile.pi             Imagem para Raspberry Pi 32 bits (armv7)
+Dockerfile.echo           Imagem arm64 para a Echo Show (so COPY, sobre a base do echo-deps.sh)
+Dockerfile.cloudflared    cloudflared armhf para a Echo Show
 compose.yaml              Monitor e Cloudflare Tunnel
 compose.pi.yaml           Monitor no Raspberry Pi (standalone)
+compose.echo.yaml         Monitor e tunnel na Echo Show (standalone)
 compose.wsl.yaml          Overlay para WSL2, com o MediaMTX no host Windows
 deploy-pi.sh              Comando forcado do deploy automatico no Pi
+echo-deps.sh              Monta a imagem base arm64 na Echo Show
+seccomp-echo.json         Perfil seccomp com a ABI aarch64, para o Docker armhf da Echo
 docker-entrypoint.sh      Inicializa MediaMTX e o servidor Python
 start-mediamtx-windows.ps1  Relay MediaMTX no host Windows, so para WSL2
 .env.exemplo              Modelo de configuracao local
