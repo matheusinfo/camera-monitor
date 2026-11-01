@@ -1,4 +1,6 @@
-FROM python:3.10-slim
+# bookworm fixo: o python:3.10-slim passou para trixie, onde libglib2.0-0 virou
+# libglib2.0-0t64 e o apt-get abaixo quebra.
+FROM python:3.10-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
