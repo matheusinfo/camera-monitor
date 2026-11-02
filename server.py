@@ -87,7 +87,10 @@ DETECT_TILES = os.environ.get("DETECT_TILES", "0") == "1"
 # portão vazio não dá nada nem no piso do modelo, 0,25 (medido de dia no Pi,
 # 2026-10). Falso alarme à noite? Suba PESSOA_MIN. Animal fica alto: alucinação.
 CONFIDENCE_MIN = {"pessoa": float(os.environ.get("PESSOA_MIN") or "0.25"),
-                  "animal": 0.65}
+                  "animal": 0.65,
+                  # o portão fechado já saiu "carro 0,29" de dia: o log mostra
+                  # cada veículo visto, com a confiança
+                  "veiculo": float(os.environ.get("CARRO_MIN") or "0.5")}
 NOTIFY_COOLDOWN_S = 20         # antispam de toast, por categoria
 # nº de análises seguidas antes de notificar. No Pi 3 cada análise leva ~4,5s:
 # com 3 para pessoa, quem para alguns segundos no portão nunca notificava. O 3
@@ -101,16 +104,33 @@ MAX_ANIMAL_AREA = 0.06         # animal ocupando mais que isso do frame é aluci
                                # Calibrado p/ esta câmera (falsos medidos: 9%-65%);
                                # se um bicho real colado no portão for ignorado, suba.
 
+
+# Carro que fica parado no mesmo lugar, em qualquer ponto da imagem (garagem,
+# rampa do portão, rua). O da rua que só passa muda de lugar a cada análise e
+# não junta CARRO_PARADO_S num lugar só. Vazio ou 0 desliga: veículo nem é
+# detectado.
+CARRO_PARADO_S = int(os.environ.get("CARRO_PARADO_S") or "0")  # no mesmo lugar até avisar
+CARRO_VEZES = 3                # e visto em pelo menos tantas análises
+CARRO_IOU = 0.5                # caixa que cobre a anterior tanto assim = mesmo lugar
+CARRO_FALHA_S = 30             # sumiu mais que isso antes de avisar: recomeça a contar
+CARRO_SAIU_S = 300             # já avisado e sumido por isso: esquece, pode avisar de novo
+MAX_CARRO_AREA = 0.85          # caixa do quadro quase inteiro é alucinação: pessoa
+                               # colada na câmera saiu "ônibus 0,68" em (0,0)-(1,1)
+
 VOC_CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle",
                "bus", "car", "cat", "chair", "cow", "diningtable", "dog",
                "horse", "motorbike", "person", "pottedplant", "sheep", "sofa",
                "train", "tvmonitor"]
 LABELS_PT = {"person": "Pessoa", "bird": "Pássaro", "cat": "Gato",
              "cow": "Vaca", "dog": "Cachorro", "horse": "Cavalo",
-             "sheep": "Ovelha"}
+             "sheep": "Ovelha", "car": "Carro", "bus": "Ônibus",
+             "motorbike": "Moto"}
 CATEGORY = {"person": "pessoa"} | {k: "animal" for k in
             ("bird", "cat", "cow", "dog", "horse", "sheep")}
-BOX_COLOR = {"pessoa": (80, 180, 255), "animal": (120, 255, 120)}  # BGR
+if CARRO_PARADO_S > 0:
+    CATEGORY |= {k: "veiculo" for k in ("car", "bus", "motorbike")}
+BOX_COLOR = {"pessoa": (80, 180, 255), "animal": (120, 255, 120),
+             "veiculo": (255, 190, 80)}  # BGR
 
 net = cv2.dnn.readNetFromCaffe("MobileNetSSD_deploy.prototxt",
                                "MobileNetSSD_deploy.caffemodel")
@@ -228,8 +248,11 @@ def desktop_notify(title: str, msg: str) -> None:
         pass
 
 
-def detect_view(frame, x0, y0, size_w, size_h):
-    """Roda o MobileNet num recorte e devolve as caixas em coordenadas do frame."""
+def detect_view(frame, x0, y0, size_w, size_h, veiculos=True):
+    """Roda o MobileNet num recorte e devolve as caixas em coordenadas do frame.
+
+    veiculos=False ignora carro/ônibus/moto: são grandes, o quadro inteiro já os
+    vê, e no recorte a caixa sai cortada (mudaria de lugar entre análises)."""
     H, W = frame.shape[:2]
     view = frame[y0:y0 + size_h, x0:x0 + size_w]
     blob = cv2.dnn.blobFromImage(cv2.resize(view, (300, 300)),
@@ -240,17 +263,26 @@ def detect_view(frame, x0, y0, size_w, size_h):
     for i in range(out.shape[2]):
         conf = float(out[0, 0, i, 2])
         cls = VOC_CLASSES[int(out[0, 0, i, 1])]
-        if cls == "person" and 0.2 <= conf:   # no log: para calibrar o limiar
-            print(f"pessoa {conf:.2f}{'' if conf >= CONFIDENCE_MIN['pessoa'] else ' (abaixo do limiar)'}",
-                  flush=True)
-        if cls not in CATEGORY or conf < CONFIDENCE_MIN[CATEGORY[cls]]:
+        cat = CATEGORY.get(cls)
+        if cat is None or (cat == "veiculo" and not veiculos):
+            continue
+        if conf < min(0.2, CONFIDENCE_MIN[cat]):
             continue
         box = out[0, 0, i, 3:7] * np.array([size_w, size_h, size_w, size_h])
         box += np.array([x0, y0, x0, y0])
         area = (box[2] - box[0]) * (box[3] - box[1]) / (W * H)
-        if CATEGORY[cls] == "animal" and area > MAX_ANIMAL_AREA:
+        if cat != "animal":   # no log: para calibrar o limiar
+            onde = (" (quadro inteiro, ignorado)"
+                    if cat == "veiculo" and area > MAX_CARRO_AREA else "")
+            print(f"{LABELS_PT[cls].lower()} {conf:.2f}{onde}"
+                  f"{'' if conf >= CONFIDENCE_MIN[cat] else ' (abaixo do limiar)'}", flush=True)
+        if conf < CONFIDENCE_MIN[cat]:
             continue
-        found.append({"label": LABELS_PT[cls], "category": CATEGORY[cls],
+        if cat == "animal" and area > MAX_ANIMAL_AREA:
+            continue
+        if cat == "veiculo" and area > MAX_CARRO_AREA:
+            continue
+        found.append({"label": LABELS_PT[cls], "category": cat,
                       "confidence": round(conf, 2),
                       "box": box.astype(int).tolist()})
     return found
@@ -267,7 +299,7 @@ def detect(frame):
     side = h // 2
     for y0 in (0, h - side):
         for x0 in range(0, w - side + 1, side // 2):
-            found += detect_view(frame, x0, y0, side, side)
+            found += detect_view(frame, x0, y0, side, side, veiculos=False)
     found.sort(key=lambda d: -d["confidence"])
     unique = []
     for d in found:  # a mesma pessoa aparece em vários recortes
@@ -339,6 +371,42 @@ def maybe_notify(dets):
         fired.append({"time": time.strftime("%H:%M:%S"), "title": titulo,
                       "msg": msg, "cat": cat})
     return fired
+
+
+# [caixa, desde, visto, vezes, avisado] de cada veículo, no lugar onde parou.
+# Os da 1ª análise entram já avisados: carro estacionado quando o serviço sobe
+# (ou coisa parada que o modelo chame de carro) não avisa.
+parados = []
+parados_inicio = [True]
+
+
+def vigia_carros(carros, now=None):
+    """Avisa uma vez por veículo que fica CARRO_PARADO_S no mesmo lugar (caixa
+    com IoU > CARRO_IOU), visto em CARRO_VEZES análises. Carro andando vira um
+    lugar novo a cada análise e não chega lá. Já avisado, só avisa de novo
+    depois de CARRO_SAIU_S sem vê-lo naquele lugar."""
+    global parados
+    now = time.time() if now is None else now
+    inicio, parados_inicio[0] = parados_inicio[0], False
+    parados = [t for t in parados
+               if now - t[2] <= (CARRO_SAIU_S if t[4] else CARRO_FALHA_S)]
+    livres, avisar = list(parados), []
+    for c in carros:
+        t = max(livres, key=lambda t: iou(t[0], c["box"]), default=None)
+        if t is None or iou(t[0], c["box"]) <= CARRO_IOU:
+            t = [c["box"], now, now, 0, inicio]
+            parados.append(t)
+        else:
+            livres.remove(t)
+        t[2], t[3] = now, t[3] + 1
+        if not t[4] and now - t[1] >= CARRO_PARADO_S and t[3] >= CARRO_VEZES:
+            t[4] = True
+            avisar.append(c["label"])
+    if not avisar:
+        return []
+    msg = f"Câmera: {', '.join(sorted(set(avisar)))} parado há {CARRO_PARADO_S} s."
+    return [{"time": time.strftime("%H:%M:%S"), "title": "Carro parado!",
+             "msg": msg, "cat": "veiculo"}]
 
 
 def kill_video(proc=None):
@@ -551,8 +619,17 @@ def detect_loop():
         if not moved(ref, thumb) and time.time() - last_run < MOTION_IDLE_S:
             continue  # cena parada: não gasta o MobileNet
         ref, last_run = thumb, time.time()
-        dets = drop_static(detect(frame))
+        todas = detect(frame)
+        # Veículo segue outro caminho: parado é justamente o que interessa (o
+        # drop_static o descartaria).
+        carros = [d for d in todas if d["category"] == "veiculo"]
+        dets = drop_static([d for d in todas if d["category"] != "veiculo"])
         fired = maybe_notify(dets)  # sempre, para zerar streaks quando a cena esvazia
+        chegou = vigia_carros(carros)
+        for ev in chegou:
+            desktop_notify(ev["title"], ev["msg"])
+        fired += chegou
+        dets += carros
         with lock:
             detect_slot["dets"] = dets
         save_events(fired, frame, ts, dets)
@@ -973,7 +1050,7 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   section{background:#1f2937;border-radius:8px;padding:14px}
   h2{font-size:13px;margin:0 0 10px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af}
   .tag{display:inline-block;margin:0 6px 6px 0;padding:4px 10px;border-radius:99px;font-size:13px}
-  .pessoa{background:#7c2d12}.animal{background:#14532d}
+  .pessoa{background:#7c2d12}.animal{background:#14532d}.veiculo{background:#1e3a8a}
   ul{list-style:none;margin:0;padding:0;font-size:13px}
   li{padding:6px 0;border-bottom:1px solid #374151}
   li time{color:#9ca3af;margin-right:8px}
@@ -1199,6 +1276,29 @@ def _selfcheck():
     assert drop_static([], now=STATIC_AFTER_S + 3) == []             # carro oscilou
     assert drop_static([car], now=STATIC_AFTER_S + 10) == []         # continua parado
     tracked = []
+    global parados
+    parados, parados_inicio[0] = [], True
+    gar = {"box": [100, 400, 900, 1080], "label": "Carro"}
+    rua = lambda x: {"box": [x, 200, x + 400, 450], "label": "Carro"}
+    assert vigia_carros([gar], now=1000) == []                       # já estava ao subir
+    assert vigia_carros([gar], now=1100) == []                       # avisado, não repete
+    assert vigia_carros([], now=1500) == [] and parados == []        # saiu: esquece
+    assert vigia_carros([gar], now=2000) == []                       # chegou
+    assert vigia_carros([gar], now=2010) == []
+    ev = vigia_carros([dict(gar, box=[110, 410, 910, 1080])], now=2021)  # balançou
+    assert ev[0]["title"] == "Carro parado!" and "Carro parado" in ev[0]["msg"]
+    assert vigia_carros([gar], now=2031) == []                       # parado: uma vez só
+    for i, x in enumerate(range(0, 1600, 150)):                      # passando na rua
+        assert vigia_carros([gar, rua(x)], now=2040 + i) == []
+    assert vigia_carros([gar, rua(500)], now=2100) == []             # parou na rua
+    assert vigia_carros([gar, rua(510)], now=2110) == []
+    assert vigia_carros([gar, rua(505)], now=2121)                   # outro carro: avisa
+    parados = []
+    assert vigia_carros([gar], now=3000) == []
+    assert vigia_carros([gar], now=3025) == []                       # 2 vistas só
+    assert vigia_carros([gar], now=3070) == []                       # sumiu 45 s: recomeça
+    assert vigia_carros([gar], now=3080) == [] and vigia_carros([gar], now=3091)
+    parados, parados_inicio[0] = [], True
     y4m = io.BytesIO(b"YUV4MPEG2 W4 H2 F8:1 Ip A1:1 C420jpeg\n"
                      + (b"FRAME\n" + bytes(12)) * 2 + b"FRAME\n" + bytes(5))
     assert [f.shape for f in y4m_frames(y4m)] == [(3, 4), (3, 4)]  # truncado cai

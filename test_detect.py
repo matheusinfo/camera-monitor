@@ -9,11 +9,14 @@ Dois lados:
 Foto de animal posterior ao CORTE não entra: não sabemos se é bicho de verdade.
 """
 import glob
+import os
 import pathlib
 
 import cv2
 
-import server
+# liga a detecção de veículo: qualquer um acima do limiar aparece
+os.environ.setdefault("CARRO_PARADO_S", "20")
+import server  # noqa: E402
 
 CORTE = "20260917_120000"        # a correção do filtro de área entrou às 11:05
 
@@ -23,10 +26,14 @@ assert falsos and pessoas, "faltam fotos de referência em fotos/"
 
 for f in falsos:
     dets = server.detect(cv2.imread(f))
+    # carro reconhecido como carro não é falso positivo: o problema era "pássaro"
+    dets = [d for d in dets if d["category"] != "veiculo"]
     assert not dets, f"{f}: voltou o falso positivo {dets}"
 
 for f in pessoas:
     dets = server.detect(cv2.imread(f))
     assert any(d["category"] == "pessoa" for d in dets), f"{f}: deixou de ver a pessoa"
+    # pessoa perto da câmera já saiu "ônibus" no quadro inteiro
+    assert not any(d["category"] == "veiculo" for d in dets), f"{f}: veículo fantasma {dets}"
 
 print(f"ok: {len(falsos)} falsos positivos barrados, {len(pessoas)} pessoas detectadas")

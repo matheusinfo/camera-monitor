@@ -93,6 +93,9 @@ Variaveis opcionais:
 | `VIDEO_FPS` | `8` | Quadros/s entregues pelo FFmpeg (4 no Pi); menos = menos CPU no video, sem afetar a deteccao |
 | `MOTION_BLOB` | `40` | Maior mancha de movimento (px, miniatura 160x90) para rodar o MobileNet; ignora chuva; `0` analisa sempre |
 | `DETECT_TILES` | `0` | `1` tambem analisa recortes do quadro: acha pessoa pequena ou atras de grade, com ~13x mais CPU. Mantenha `0` no Pi |
+| `PESSOA_MIN` | `0.25` | Confianca minima para alerta de pessoa |
+| `CARRO_PARADO_S` | vazio | Segundos com um carro parado no mesmo lugar, em qualquer ponto da imagem, ate avisar (ex.: `20`). Carro que so passa nao avisa. Vazio ou `0` desliga |
+| `CARRO_MIN` | `0.5` | Confianca minima para contar um veiculo |
 | `WINDOWS_HOST` | vazio | So para WSL2, com `compose.wsl.yaml` |
 
 O arquivo `.env` e ignorado pelo Git. Nunca coloque credenciais diretamente em `compose.yaml`, no codigo ou em commits.
