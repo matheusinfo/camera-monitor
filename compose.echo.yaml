@@ -25,12 +25,20 @@ services:
       context: .
       dockerfile: Dockerfile.echo
     restart: unless-stopped
+    # Sem root: se o app for invadido, o atacante fica com um usuario comum, sem
+    # poder mexer no container. O 3003 e para abrir sockets (kernel Android).
+    # fotos/ precisa ser do 10002: chown -R 10002:10002 fotos
+    user: "10002:10002"
+    group_add: ["3003"]
+    cap_drop: [ALL]
     security_opt:
       - seccomp=./seccomp-echo.json
+      - no-new-privileges:true
     env_file: .env
     environment:
       # Horario de Brasilia sem depender do tzdata (sem horario de verao desde 2019).
       TZ: "<-03>3"
+      HOME: /tmp
       CAM_PATH: onvif2
       DETECT_THREADS: "1"
       DETECT_INTERVAL_S: "0.3"

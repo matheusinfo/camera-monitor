@@ -295,6 +295,7 @@ tar -czf - Dockerfile.echo Dockerfile.cloudflared compose.echo.yaml echo-deps.sh
     seccomp-echo.json requirements-docker.txt server.py config.py ptz.py gunicorn.conf.py \
     docker-entrypoint.sh MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel \
   | ssh echo 'mkdir -p /data/camera-monitor/fotos && tar -C /data/camera-monitor -xzf -'
+ssh echo 'chown -R 10002:10002 /data/camera-monitor/fotos'  # o app roda sem root (uid 10002)
 ```
 
 O `.env` vai a parte, uma vez (`chmod 600`). Na primeira vez, e quando mudar
