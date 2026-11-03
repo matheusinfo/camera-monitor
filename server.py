@@ -189,7 +189,7 @@ def cf_access_ok():
 
 @app.before_request
 def require_login():
-    if request.path == "/healthz":
+    if request.path in ("/healthz", "/favicon.svg", "/favicon.ico"):
         return None
     if CF_ACCESS_TEAM and CF_ACCESS_AUD and "Cf-Access-Jwt-Assertion" in request.headers:
         return None if cf_access_ok() else ("acesso pelo Cloudflare Access", 403)
@@ -1033,9 +1033,29 @@ def index():
     return PAGE
 
 
+# Icone da aba: camera clara no fundo do cabecalho, lente azul e ponto vermelho
+# de gravacao. Fica no codigo para nao mudar o COPY dos Dockerfiles.
+FAVICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<rect width="64" height="64" rx="14" fill="#1f2937"/>
+<path d="M23 16h18l4 7h7a4 4 0 0 1 4 4v21a4 4 0 0 1-4 4H12a4 4 0 0 1-4-4V27a4 4 0 0 1 4-4h7z" fill="#e5e7eb"/>
+<circle cx="32" cy="37" r="11" fill="#1f2937"/>
+<circle cx="32" cy="37" r="6.5" fill="#38bdf8"/>
+<circle cx="49" cy="30" r="3" fill="#ef4444"/>
+</svg>"""
+
+
+# /favicon.ico: navegador que nao le o <link> pede esse caminho por conta propria.
+@app.route("/favicon.svg")
+@app.route("/favicon.ico")
+def favicon():
+    return Response(FAVICON, mimetype="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Monitor da Câmera</title><style>
+<title>Monitor da Câmera</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
   body{margin:0;font:14px system-ui,sans-serif;background:#111827;color:#e5e7eb}
   header{padding:14px 20px;background:#1f2937;display:flex;gap:12px;align-items:center}
   h1{font-size:16px;margin:0}

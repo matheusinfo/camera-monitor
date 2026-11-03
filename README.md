@@ -389,8 +389,11 @@ A camera precisa aceitar o endpoint ONVIF configurado em `ptz.py`. O firmware po
 | `/posicoes` | Lista as posicoes salvas |
 | `/posicoes/<nome>` | `PUT` salva a atual, `POST` vai ate ela, `DELETE` apaga |
 | `/fotos/<nome>` | Fotos dos alertas |
+| `/favicon.svg` | Icone da aba do navegador (tambem em `/favicon.ico`) |
 
-Todos os endpoints, exceto `/healthz`, exigem autenticacao Basic.
+Todos os endpoints, exceto `/healthz` e o icone, exigem autenticacao Basic. O
+icone e um SVG dentro do `server.py` (constante `FAVICON`): para trocar, edite
+ali; nao ha arquivo de imagem para copiar no deploy.
 
 ## Operacao e diagnostico
 
