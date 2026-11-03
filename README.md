@@ -94,6 +94,7 @@ Variaveis opcionais:
 | `MOTION_BLOB` | `40` | Maior mancha de movimento (px, miniatura 160x90) para rodar o MobileNet; ignora chuva; `0` analisa sempre |
 | `DETECT_TILES` | `0` | `1` tambem analisa recortes do quadro: acha pessoa pequena ou atras de grade, com ~13x mais CPU. Mantenha `0` no Pi |
 | `PESSOA_MIN` | `0.25` | Confianca minima para alerta de pessoa |
+| `PESSOA_BASE_MIN` | `0.7` | Pessoa cuja caixa termina acima dessa fracao da altura do quadro esta longe (moto e carro na rua, vistos pela grade) e nao avisa. `0` desliga |
 | `CARRO_PARADO_S` | vazio | Segundos com um carro parado no mesmo lugar, em qualquer ponto da imagem, ate avisar (ex.: `20`). Carro que so passa nao avisa. Vazio ou `0` desliga |
 | `CARRO_MIN` | `0.5` | Confianca minima para contar um veiculo |
 | `WINDOWS_HOST` | vazio | So para WSL2, com `compose.wsl.yaml` |
@@ -439,6 +440,18 @@ No Raspberry Pi:
   Duration* da aplicacao no Zero Trust.
 
 ## Limitacoes conhecidas
+
+- **Falsos alertas de pessoa:** dois filtros, medidos nos alertas da Echo em
+  2026-11, descartam a caixa antes de avisar. O log mostra o motivo
+  (`pessoa 0.42 (longe, na rua, ignorado)`).
+  - *Rua:* quem passa de moto ou carro aparece entre as grades, mas longe, e a
+    base da caixa fica no meio do quadro (44-56% da altura). Quem chega no
+    portao esta perto da camera e a caixa desce ate o pe da imagem (86-100%).
+    O corte e `PESSOA_BASE_MIN`. Ele depende do enquadramento: se o PTZ passar
+    a olhar a rua de cima, reveja o valor.
+  - *Chuva na lente:* de noite, no IR, os pingos viram uma caixa do topo ao pe
+    do quadro, com confianca de 0,25-0,53. Caixa que encosta nas duas bordas
+    so avisa a partir de 0,6; pessoa colada na camera passa de 0,8.
 
 - **Falar pela camera (audio bidirecional):** nao suportado. A camera (Yoosee)
   anuncia `AudioOutputs = 0` no ONVIF; o alto-falante so e acessivel pelo

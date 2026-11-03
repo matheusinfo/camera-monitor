@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Menos alerta falso de pessoa: quem passa de moto ou carro na rua, visto pela grade, nao avisa mais (caixa com a base acima de `PESSOA_BASE_MIN`, 70% da altura). Chuva na lente, que virava uma caixa do topo ao pe do quadro, so avisa com confianca de 0,6 ou mais. O log mostra o motivo do descarte.
 - Adicionado icone na aba do navegador (`/favicon.svg`, tambem em `/favicon.ico`): camera em SVG, dentro do `server.py`, sem pedir login.
 - Adicionado alerta de carro parado (`CARRO_PARADO_S`): avisa uma vez quando um veiculo fica esse tempo no mesmo lugar, em qualquer ponto da imagem (garagem, rampa, rua); carro que so passa muda de lugar e nao avisa. O mesmo carro so avisa de novo depois de 5 min sem ser visto ali. Caixa de veiculo do quadro quase inteiro e descartada (pessoa colada na camera saia "onibus 0,68").
 - Corrigido: o historico de alertas sumia do painel ao reiniciar o container ou a Echo. Agora fica em `fotos/eventos.jsonl`, com data no horario.

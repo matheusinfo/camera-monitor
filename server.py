@@ -91,6 +91,16 @@ CONFIDENCE_MIN = {"pessoa": float(os.environ.get("PESSOA_MIN") or "0.25"),
                   # o portão fechado já saiu "carro 0,29" de dia: o log mostra
                   # cada veículo visto, com a confiança
                   "veiculo": float(os.environ.get("CARRO_MIN") or "0.5")}
+# Moto e carro na rua aparecem entre as grades, mas longe: a base da caixa fica
+# no meio do quadro. Quem chega no portão está perto, e a caixa desce até o pé
+# da imagem (Echo, 2026-11: rua com base em 44-56% da altura, portão em
+# 86-100%). Depende do enquadramento: se o PTZ passar a olhar a rua de cima,
+# reveja. 0 desliga.
+PESSOA_BASE_MIN = float(os.environ.get("PESSOA_BASE_MIN") or "0.7")
+# Chuva na lente vira caixa de pessoa do topo ao pé do quadro (0,25-0,53, à
+# noite no IR e de dia). Pessoa de verdade, até de corpo inteiro no portão, não
+# encosta nas duas bordas; colada na câmera, sai acima de 0,8.
+PESSOA_ALTA_MIN = 0.6
 NOTIFY_COOLDOWN_S = 20         # antispam de toast, por categoria
 # nº de análises seguidas antes de notificar. No Pi 3 cada análise leva ~4,5s:
 # com 3 para pessoa, quem para alguns segundos no portão nunca notificava. O 3
@@ -248,6 +258,17 @@ def desktop_notify(title: str, msg: str) -> None:
         pass
 
 
+def pessoa_ignorada(box, conf, H, fundo):
+    """Motivo para descartar a caixa de pessoa (coordenadas do quadro), ou None.
+    fundo: borda de baixo do recorte analisado. Caixa cortada por ela não diz
+    onde estão os pés."""
+    if box[1] <= 0.03 * H and box[3] >= 0.97 * H and conf < PESSOA_ALTA_MIN:
+        return "do topo ao pé, chuva na lente"
+    if box[3] < PESSOA_BASE_MIN * H and box[3] < fundo - 0.03 * H:
+        return "longe, na rua"
+    return None
+
+
 def detect_view(frame, x0, y0, size_w, size_h, veiculos=True):
     """Roda o MobileNet num recorte e devolve as caixas em coordenadas do frame.
 
@@ -271,16 +292,18 @@ def detect_view(frame, x0, y0, size_w, size_h, veiculos=True):
         box = out[0, 0, i, 3:7] * np.array([size_w, size_h, size_w, size_h])
         box += np.array([x0, y0, x0, y0])
         area = (box[2] - box[0]) * (box[3] - box[1]) / (W * H)
+        motivo = None
+        if cat == "veiculo" and area > MAX_CARRO_AREA:
+            motivo = "quadro inteiro"
+        elif cat == "pessoa":
+            motivo = pessoa_ignorada(box, conf, H, y0 + size_h)
         if cat != "animal":   # no log: para calibrar o limiar
-            onde = (" (quadro inteiro, ignorado)"
-                    if cat == "veiculo" and area > MAX_CARRO_AREA else "")
-            print(f"{LABELS_PT[cls].lower()} {conf:.2f}{onde}"
+            print(f"{LABELS_PT[cls].lower()} {conf:.2f}"
+                  f"{f' ({motivo}, ignorado)' if motivo else ''}"
                   f"{'' if conf >= CONFIDENCE_MIN[cat] else ' (abaixo do limiar)'}", flush=True)
-        if conf < CONFIDENCE_MIN[cat]:
+        if conf < CONFIDENCE_MIN[cat] or motivo:
             continue
         if cat == "animal" and area > MAX_ANIMAL_AREA:
-            continue
-        if cat == "veiculo" and area > MAX_CARRO_AREA:
             continue
         found.append({"label": LABELS_PT[cls], "category": cat,
                       "confidence": round(conf, 2),
@@ -1297,6 +1320,17 @@ def _selfcheck():
     assert drop_static([car], now=STATIC_AFTER_S + 10) == []         # continua parado
     tracked = []
     global parados
+    # caixas dos alertas da Echo (640x360), em fração do quadro
+    px = lambda y1, y2: [0, y1 * 360, 100, y2 * 360]
+    for y1, y2, c in ((0.02, 0.46, 0.42), (0.11, 0.44, 0.25), (0.21, 0.56, 0.36)):
+        assert pessoa_ignorada(px(y1, y2), c, 360, 360) == "longe, na rua"
+    for y1, y2, c in ((0.01, 0.99, 0.25), (0.02, 1.00, 0.39), (0.02, 1.00, 0.53)):
+        assert pessoa_ignorada(px(y1, y2), c, 360, 360) == "do topo ao pé, chuva na lente"
+    for y1, y2, c in ((0.16, 0.86, 0.35), (0.65, 1.00, 0.27), (0.24, 0.98, 0.31),
+                      (0.01, 0.93, 0.56),     # corpo inteiro no portão, outubro
+                      (0.00, 1.00, 0.85)):    # colado na câmera
+        assert pessoa_ignorada(px(y1, y2), c, 360, 360) is None
+    assert pessoa_ignorada(px(0.3, 0.5), 0.4, 360, 180) is None      # recorte cortou os pés
     parados, parados_inicio[0] = [], True
     gar = {"box": [100, 400, 900, 1080], "label": "Carro"}
     rua = lambda x: {"box": [x, 200, x + 400, 450], "label": "Carro"}
