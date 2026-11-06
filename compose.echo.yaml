@@ -43,6 +43,7 @@ services:
       DETECT_THREADS: "1"
       DETECT_INTERVAL_S: "0.3"
       DETECT_TILES: "0"
+      PAINEL_LOCAL: Echo Show   # no titulo do painel
     ports:
       - "127.0.0.1:8090:8090"
     volumes:

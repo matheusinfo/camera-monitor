@@ -7,6 +7,7 @@ http://localhost:8090 e dispara uma notificação desktop.
 """
 
 import hashlib
+import html
 import hmac
 import io
 import json
@@ -62,7 +63,7 @@ FOTOS_DIR = "fotos"            # snapshot anotado de cada notificação
 # Histórico do painel junto das fotos, no mesmo volume: sobrevive a reiniciar o
 # container ou o aparelho (antes era só memória e o painel voltava vazio).
 EVENTS_FILE = os.path.join(FOTOS_DIR, "eventos.jsonl")
-EVENTS_MAX = 50
+EVENTS_MAX = 10                # alertas no painel; todos ficam em /historico
 # A detecção roda em thread própria sobre o frame mais recente, então o vídeo não
 # trava enquanto ela pensa (num Pi 3 uma análise custa ~2,5s). Estes dois são o
 # botão de CPU: pausa entre análises e threads do OpenCV (0 = todas).
@@ -83,6 +84,8 @@ MOTION_IDLE_S = 10
 # 1 = além do frame inteiro, analisa recortes (acha pessoa pequena ou atrás de
 # grade; custa ~15x mais CPU por análise). Deixe 0 no Raspberry Pi.
 DETECT_TILES = os.environ.get("DETECT_TILES", "0") == "1"
+# Onde o monitor roda, no título do painel (ex.: "Echo Show"). Vazio não mostra.
+PAINEL_LOCAL = os.environ.get("PAINEL_LOCAL", "")
 # Pessoa atrás da grade do portão sai com 0,25-0,45 (barras cortam o corpo);
 # portão vazio não dá nada nem no piso do modelo, 0,25 (medido de dia no Pi,
 # 2026-10). Falso alarme à noite? Suba PESSOA_MIN. Animal fica alto: alucinação.
@@ -894,6 +897,34 @@ def foto(name):
     return send_from_directory(FOTOS_DIR, name)
 
 
+# Foto de alerta: AAAAMMDD_HHMMSS_categoria.jpg (save_events)
+FOTO_RE = re.compile(r"(\d{8})_(\d{6})_(pessoa|animal|veiculo)\.jpg")
+
+
+def historico():
+    """Todas as fotos de alerta, mais novas primeiro. A fonte é a pasta, não o
+    eventos.jsonl: ele é cortado em EVENTS_MAX e não tem as antigas."""
+    itens = []
+    for nome in os.listdir(FOTOS_DIR):
+        m = FOTO_RE.fullmatch(nome)
+        if m:
+            d, h, cat = m.groups()
+            itens.append({"photo": nome, "dia": f"{d[:4]}-{d[4:6]}-{d[6:]}",
+                          "hora": f"{h[:2]}:{h[2:4]}:{h[4:]}", "cat": cat})
+    itens.sort(key=lambda i: i["photo"], reverse=True)
+    return itens
+
+
+@app.route("/historico")
+def historico_page():
+    return HISTORICO
+
+
+@app.route("/historico.json")
+def historico_json():
+    return jsonify(historico())
+
+
 @app.route("/status")
 def status():
     with lock:
@@ -1086,6 +1117,8 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   #st.on{background:#14532d}
   #snd,#pip,#au,#aual{background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:6px 12px;cursor:pointer}
   #snd{margin-left:auto}
+  #hist{margin-left:auto;background:#374151;color:#e5e7eb;border-radius:6px;padding:6px 12px;text-decoration:none}
+  .todas{display:block;margin-top:10px;color:#93c5fd;text-decoration:none}
   #snd.on,#au.on,#aual.on{background:#1d4ed8}
   main{display:grid;grid-template-columns:2fr 1fr;gap:16px;padding:16px;max-width:1300px;margin:auto}
   @media(max-width:900px){main{grid-template-columns:1fr}}
@@ -1128,7 +1161,8 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   body.so-pip header h1,body.so-pip .lista{display:none}
   body.so-pip main{grid-template-columns:1fr;padding:8px}
 </style></head><body>
-<header><h1>📷 Monitor da Câmera <span style="color:#9ca3af;font-weight:400">· Raspberry Pi</span></h1>
+<header><h1>📷 Monitor da Câmera{{LOCAL}}</h1>
+<a id="hist" href="/historico" target="_blank" title="todas as fotos, por dia">🗂 Histórico</a>
 <button id="pip" title="Painel flutuante por cima de tudo, com todos os controles">🗗 PiP</button></header>
 <main>
   <!-- #painel é movido inteiro para a janela de PiP: os controles vão junto, com
@@ -1150,7 +1184,8 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   </div>
   <div class="lista">
     <section><h2>Notificações</h2>
-      <ul id="log"><li class="empty">nenhuma ainda</li></ul></section>
+      <ul id="log"><li class="empty">nenhuma ainda</li></ul>
+      <a class="todas" href="/historico" target="_blank">ver todas as fotos →</a></section>
   </div>
 </main>
 <p id="aviso" hidden>painel aberto na janela flutuante</p>
@@ -1305,6 +1340,105 @@ function pipAlert(){ // pisca a borda do painel ~2,4s, esteja ele na página ou 
   painel.style.outline='4px solid #ef4444';
   setTimeout(()=>{ painel.style.outline=''; },2400); }
 setInterval(tick, 1500); tick();
+</script></body></html>"""
+PAGE = PAGE.replace("{{LOCAL}}", f' <span style="color:#9ca3af;font-weight:400">· '
+                    f'{html.escape(PAINEL_LOCAL)}</span>' if PAINEL_LOCAL else "")
+
+
+HISTORICO = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Histórico da Câmera</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
+  body{margin:0;font:14px system-ui,sans-serif;background:#111827;color:#e5e7eb}
+  header{padding:14px 20px;background:#1f2937;display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+         position:sticky;top:0;z-index:1}
+  h1{font-size:16px;margin:0 auto 0 0}
+  select,.cat{background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:6px 10px;font:inherit;cursor:pointer}
+  .cat.on{background:#1d4ed8}
+  a{color:#93c5fd;text-decoration:none}
+  main{padding:16px;max-width:1300px;margin:auto}
+  h2{font-size:13px;margin:22px 0 10px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af}
+  h2:first-child{margin-top:0}
+  .grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(220px,40vw),1fr));gap:10px}
+  figure{margin:0;background:#1f2937;border-radius:8px;overflow:hidden;cursor:zoom-in}
+  figure img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
+  figcaption{padding:6px 8px;display:flex;justify-content:space-between;color:#9ca3af}
+  .tag{padding:1px 8px;border-radius:99px;font-size:12px;color:#e5e7eb}
+  .pessoa{background:#7c2d12}.animal{background:#14532d}.veiculo{background:#1e3a8a}
+  #vazio{color:#6b7280;text-align:center;padding:40px}
+  #mais{display:block;margin:20px auto;background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:8px 16px;cursor:pointer}
+  #zoom{position:fixed;inset:0;background:rgba(0,0,0,.92);display:flex;flex-direction:column;
+        align-items:center;justify-content:center;gap:8px;z-index:2}
+  #zoom[hidden]{display:none}
+  #zoom img{max-width:96vw;max-height:84vh;border-radius:6px}
+  #zoom .nav{display:flex;gap:10px;align-items:center}
+  #zoom button{background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:8px 14px;font-size:16px;cursor:pointer}
+</style></head><body>
+<header><h1>🗂 Histórico</h1>
+  <select id="dia" title="dia"></select>
+  <button class="cat on" data-c="">Todas</button><button class="cat" data-c="pessoa">Pessoa</button>
+  <button class="cat" data-c="animal">Animal</button><button class="cat" data-c="veiculo">Carro</button>
+  <a href="/">← ao vivo</a></header>
+<main id="lista"></main>
+<div id="zoom" hidden><img alt="foto do alerta"><div class="nav">
+  <button id="ant" title="mais nova (←)">◀</button><span id="leg"></span>
+  <button id="prox" title="mais antiga (→)">▶</button>
+  <a id="abrir" target="_blank">abrir</a><button id="fechar" title="fechar (Esc)">✕</button></div></div>
+<script>
+const NOMES={pessoa:'Pessoa',animal:'Animal',veiculo:'Carro'}, LOTE=120;
+let todas=[], vistas=[], mostrando=0, cat='', aberta=-1;
+const $=id=>document.getElementById(id), lista=$('lista'), selDia=$('dia');
+const fmtDia=d=>new Date(d+'T12:00').toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'2-digit',year:'numeric'});
+async function carregar(){
+  todas=await (await fetch('/historico.json')).json();
+  const dias={}; todas.forEach(f=>dias[f.dia]=(dias[f.dia]||0)+1);
+  selDia.innerHTML=`<option value="">Todos os dias (${todas.length})</option>`+
+    Object.keys(dias).map(d=>`<option value="${d}">${fmtDia(d)} (${dias[d]})</option>`).join('');
+  filtrar();
+}
+function filtrar(){
+  vistas=todas.filter(f=>(!selDia.value||f.dia===selDia.value)&&(!cat||f.cat===cat));
+  mostrando=0; lista.innerHTML=''; mais();
+}
+function mais(){   // em lotes: com milhares de fotos, a página não monta tudo de uma vez
+  $('mais')?.remove();
+  if(!vistas.length){ lista.innerHTML='<p id="vazio">nenhuma foto</p>'; return; }
+  const fim=Math.min(vistas.length,mostrando+LOTE);
+  for(let i=mostrando;i<fim;i++){
+    const f=vistas[i];
+    let g=lista.lastElementChild;
+    if(!g||g.dataset.dia!==f.dia){
+      const n=vistas.filter(v=>v.dia===f.dia).length;
+      lista.insertAdjacentHTML('beforeend',`<h2>${fmtDia(f.dia)} · ${n} foto${n>1?'s':''}</h2><div class="grade" data-dia="${f.dia}"></div>`);
+      g=lista.lastElementChild;
+    }
+    g.insertAdjacentHTML('beforeend',`<figure data-i="${i}"><img src="/fotos/${f.photo}" loading="lazy" alt="">
+      <figcaption><span>${f.hora}</span><span class="tag ${f.cat}">${NOMES[f.cat]}</span></figcaption></figure>`);
+  }
+  mostrando=fim;
+  if(mostrando<vistas.length)
+    lista.insertAdjacentHTML('beforeend',`<button id="mais">mostrar mais (${vistas.length-mostrando} restantes)</button>`);
+}
+lista.onclick=e=>{
+  if(e.target.id==='mais') return mais();
+  const fig=e.target.closest('figure'); if(fig) abrir(+fig.dataset.i);
+};
+function abrir(i){
+  if(i<0||i>=vistas.length) return;
+  aberta=i; const f=vistas[i], z=$('zoom');
+  z.querySelector('img').src='/fotos/'+f.photo; $('abrir').href='/fotos/'+f.photo;
+  $('leg').textContent=`${fmtDia(f.dia)} ${f.hora} · ${NOMES[f.cat]} · ${i+1}/${vistas.length}`;
+  z.hidden=false;
+}
+const fechar=()=>{ $('zoom').hidden=true; aberta=-1; };
+$('ant').onclick=()=>abrir(aberta-1); $('prox').onclick=()=>abrir(aberta+1); $('fechar').onclick=fechar;
+$('zoom').onclick=e=>{ if(e.target.id==='zoom') fechar(); };
+document.onkeydown=e=>{ if(aberta<0) return;
+  if(e.key==='Escape') fechar(); else if(e.key==='ArrowLeft') abrir(aberta-1); else if(e.key==='ArrowRight') abrir(aberta+1); };
+selDia.onchange=filtrar;
+document.querySelectorAll('.cat').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('.cat').forEach(x=>x.classList.toggle('on',x===b)); cat=b.dataset.c; filtrar(); });
+carregar();
 </script></body></html>"""
 
 

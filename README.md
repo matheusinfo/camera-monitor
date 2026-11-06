@@ -25,6 +25,7 @@ O Camera Monitor transforma o stream RTSP da camera em um painel web pratico par
 - Converte o video para MJPEG e analisa os frames com MobileNet-SSD.
 - Detecta pessoas e animais com limiar de confianca configuravel no codigo.
 - Desenha as deteccoes no stream e registra fotos dos alertas.
+- Mostra os 10 alertas mais recentes no painel e todas as fotos na pagina de historico, por dia, com filtro por dia e por tipo.
 - Envia notificacoes desktop no Linux e no Windows.
 - Envia push para o celular (app ntfy) com a foto do alerta e link para o ao vivo.
 - Reproduz o audio da camera pelo navegador.
@@ -87,6 +88,7 @@ Variaveis opcionais:
 | --- | --- | --- |
 | `CAM_AUDIO_PATH` | vazio | Caminho da camera de onde puxar o audio, quando `CAM_PATH` nao tem audio (ex.: `onvif2` + `onvif1`) |
 | `NTFY_URL` | vazio | Topico ntfy para push no celular. Vazio desliga o push |
+| `PAINEL_LOCAL` | vazio | Onde o monitor roda, no titulo do painel. Os composes da Echo e do Pi ja definem (`Echo Show`, `Raspberry Pi`) |
 | `PUBLIC_URL` | vazio | Endereco publico do painel; tocar na notificacao abre o ao vivo |
 | `DETECT_THREADS` | `0` (todas) | Threads do OpenCV na deteccao |
 | `DETECT_INTERVAL_S` | `0.4` | Pausa minima entre duas analises |
@@ -273,7 +275,7 @@ O que muda em relacao ao Pi:
   analise por ~13.
 - **Persistencia.** `restart: unless-stopped` e o dockerd subindo pelo
   supervisor do techo5 trazem os containers de volta depois de reiniciar a
-  Echo. Fotos e historico (`fotos/eventos.jsonl`) ficam em
+  Echo. Fotos e historico (`fotos/eventos.jsonl`, com os ultimos 10 do painel) ficam em
   `/data/camera-monitor/fotos`.
 
 `CAM_PATH`, `DETECT_THREADS`, `DETECT_INTERVAL_S`, `DETECT_TILES` e `TZ` ficam
@@ -390,6 +392,8 @@ A camera precisa aceitar o endpoint ONVIF configurado em `ptz.py`. O firmware po
 | `/posicoes` | Lista as posicoes salvas |
 | `/posicoes/<nome>` | `PUT` salva a atual, `POST` vai ate ela, `DELETE` apaga |
 | `/fotos/<nome>` | Fotos dos alertas |
+| `/historico` | Todas as fotos de alerta, por dia, com filtro e zoom (botao **Historico** no painel) |
+| `/historico.json` | Lista das fotos: nome, dia, hora e tipo |
 | `/favicon.svg` | Icone da aba do navegador (tambem em `/favicon.ico`) |
 
 Todos os endpoints, exceto `/healthz` e o icone, exigem autenticacao Basic. O
