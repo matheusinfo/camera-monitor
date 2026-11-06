@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Foto e push do alerta saem limpos, sem a caixa e a porcentagem por cima da pessoa; o video ao vivo continua marcado. A caixa e a confianca de cada alerta ficam em `fotos/eventos.jsonl`, que nao e mais cortado ao reiniciar (o painel segue com os 10 mais recentes).
 - Painel mostra so os 10 alertas mais recentes. Todas as fotos ficam na nova pagina `/historico` (botao **Historico**): agrupadas por dia, com filtro por dia e por tipo e zoom com setas. A lista sai da pasta `fotos/`, entao inclui as fotos que ja tinham saido do painel.
 - Titulo do painel mostra onde o monitor roda pela variavel `PAINEL_LOCAL` (`Echo Show` na Echo); antes era sempre "Raspberry Pi".
 - Menos alerta falso de pessoa: quem passa de moto ou carro na rua, visto pela grade, nao avisa mais (caixa com a base acima de `PESSOA_BASE_MIN`, 70% da altura). Chuva na lente, que virava uma caixa do topo ao pe do quadro, so avisa com confianca de 0,6 ou mais. O log mostra o motivo do descarte.

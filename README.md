@@ -24,7 +24,7 @@ O Camera Monitor transforma o stream RTSP da camera em um painel web pratico par
 - Usa MediaMTX como relay para lidar com a negociacao RTSP da camera.
 - Converte o video para MJPEG e analisa os frames com MobileNet-SSD.
 - Detecta pessoas e animais com limiar de confianca configuravel no codigo.
-- Desenha as deteccoes no stream e registra fotos dos alertas.
+- Desenha as deteccoes no video ao vivo e registra a foto de cada alerta, limpa (sem caixa por cima).
 - Mostra os 10 alertas mais recentes no painel e todas as fotos na pagina de historico, por dia, com filtro por dia e por tipo.
 - Envia notificacoes desktop no Linux e no Windows.
 - Envia push para o celular (app ntfy) com a foto do alerta e link para o ao vivo.
@@ -275,7 +275,7 @@ O que muda em relacao ao Pi:
   analise por ~13.
 - **Persistencia.** `restart: unless-stopped` e o dockerd subindo pelo
   supervisor do techo5 trazem os containers de volta depois de reiniciar a
-  Echo. Fotos e historico (`fotos/eventos.jsonl`, com os ultimos 10 do painel) ficam em
+  Echo. Fotos e historico (`fotos/eventos.jsonl`, com a caixa e a confianca de cada alerta) ficam em
   `/data/camera-monitor/fotos`.
 
 `CAM_PATH`, `DETECT_THREADS`, `DETECT_INTERVAL_S`, `DETECT_TILES` e `TZ` ficam

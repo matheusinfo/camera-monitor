@@ -163,10 +163,11 @@ lock = threading.Lock()
 
 
 def load_events():
-    """Recarrega o histórico e corta o arquivo nos EVENTS_MAX mais recentes."""
+    """Põe os EVENTS_MAX mais recentes no painel. O arquivo fica inteiro: guarda
+    as caixas e a confiança de cada alerta, que a foto não mostra mais."""
     try:
         with open(EVENTS_FILE, encoding="utf-8") as f:
-            linhas = f.read().splitlines()[-EVENTS_MAX:]
+            linhas = f.read().splitlines()
     except FileNotFoundError:
         return
     eventos = []
@@ -175,8 +176,8 @@ def load_events():
             eventos.append(json.loads(linha))
         except ValueError:
             pass  # linha pela metade de um desligamento no meio da escrita
-    for ev in eventos:
-        state["events"].appendleft(ev)
+    for ev in eventos[-EVENTS_MAX:]:
+        state["events"].appendleft({k: v for k, v in ev.items() if k != "dets"})
     with open(EVENTS_FILE + ".tmp", "w", encoding="utf-8") as f:
         f.writelines(json.dumps(ev, ensure_ascii=False) + "\n" for ev in eventos)
     os.replace(EVENTS_FILE + ".tmp", EVENTS_FILE)
@@ -589,12 +590,12 @@ def save_events(fired, frame, ts, dets):
     """Foto e push com o quadro que foi analisado, não com o mais novo.
 
     Em CPU lenta (Echo Show: segundos por análise) o quadro do momento em que a
-    análise termina já não tem a pessoa, e a caixa ficava no vazio."""
+    análise termina já não tem a pessoa. A foto vai limpa, sem caixa nem
+    porcentagem por cima; caixas e confiança ficam no eventos.jsonl (para
+    calibrar a detecção)."""
     if not fired:
         return
-    photo = frame.copy()
-    draw_dets(photo, dets)
-    ok, jpg = cv2.imencode(".jpg", photo, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     if not ok:
         return
     stamp = time.localtime(ts)
@@ -605,7 +606,8 @@ def save_events(fired, frame, ts, dets):
             f.write(jpg.tobytes())
         phone_notify(ev["title"], ev["msg"], jpg.tobytes())
     with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-        f.writelines(json.dumps(ev, ensure_ascii=False) + "\n" for ev in fired)
+        f.writelines(json.dumps(dict(ev, dets=dets), ensure_ascii=False) + "\n"
+                     for ev in fired)
     with lock:
         for ev in fired:
             state["events"].appendleft(ev)
