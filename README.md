@@ -25,9 +25,13 @@ O Camera Monitor transforma o stream RTSP da camera em um painel web pratico par
 - Converte o video para MJPEG e analisa os frames com MobileNet-SSD.
 - Detecta pessoas e animais com limiar de confianca configuravel no codigo.
 - Desenha as deteccoes no video ao vivo e registra a foto de cada alerta, limpa (sem caixa por cima).
-- Mostra os 10 alertas mais recentes no painel e todas as fotos na pagina de historico, por dia, com filtro por dia e por tipo.
+- Junta as fotos seguidas da mesma pessoa (ou bicho) numa visita: um push quando ela chega, e mais uma foto a cada 20 s enquanto fica, sem push.
+- Mostra as 10 visitas mais recentes no painel e todas as fotos na pagina de historico, por visita e por dia, com filtro por dia e por tipo. Cada visita pode ser marcada como alerta certo ou falso alarme, e o `test_detect.py` confere a deteccao contra essas marcacoes.
 - Envia notificacoes desktop no Linux e no Windows.
 - Envia push para o celular (app ntfy) com a foto do alerta e link para o ao vivo.
+- Modo em casa: guarda as fotos sem mandar push, sempre ou num horario.
+- Video em HD: o stream principal (1080p) copiado pelo MediaMTX, sem decodificar no aparelho, com as caixas da deteccao por cima.
+- Heartbeat para um servico externo: se o proprio aparelho cair, voce fica sabendo.
 - Reproduz o audio da camera pelo navegador.
 - Controla o eixo horizontal e vertical da camera via ONVIF/PTZ.
 - Protege o painel com usuario e senha HTTP Basic.
@@ -93,6 +97,8 @@ Variaveis opcionais:
 | `DETECT_THREADS` | `0` (todas) | Threads do OpenCV na deteccao |
 | `DETECT_INTERVAL_S` | `0.4` | Pausa minima entre duas analises |
 | `VIDEO_FPS` | `8` | Quadros/s entregues pelo FFmpeg (4 no Pi); menos = menos CPU no video, sem afetar a deteccao |
+| `VISITA_FIM_S` | `90` | Segundos sem ver a pessoa (ou bicho) ate a visita acabar; a proxima vez que aparecer e outra visita, com push |
+| `HEARTBEAT_URL` | vazio | URL que recebe um GET a cada 5 min enquanto o video chega (ex.: check do healthchecks.io). Vazio desliga |
 | `MOTION_BLOB` | `40` | Maior mancha de movimento (px, miniatura 160x90) para rodar o MobileNet; ignora chuva; `0` analisa sempre |
 | `DETECT_TILES` | `0` | `1` tambem analisa recortes do quadro: acha pessoa pequena ou atras de grade, com ~13x mais CPU. Mantenha `0` no Pi |
 | `PESSOA_MIN` | `0.25` | Confianca minima para alerta de pessoa |
@@ -290,35 +296,35 @@ NTFY_URL=https://ntfy.sh/<topico-secreto>
 PUBLIC_URL=https://camera.seudominio.com/
 ```
 
-Copiar para a Echo (o SSH do techo5 entra como root; aqui com `Host echo` no
-`~/.ssh/config`):
+Para instalar ou atualizar, da raiz do projeto (o SSH do techo5 entra como
+root; aqui com `Host echo` no `~/.ssh/config`, ou outro host em `ECHO_HOST`):
 
 ```bash
-tar -czf - Dockerfile.echo Dockerfile.cloudflared compose.echo.yaml echo-deps.sh \
-    seccomp-echo.json requirements-docker.txt server.py config.py ptz.py gunicorn.conf.py \
-    docker-entrypoint.sh MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel \
-  | ssh echo 'mkdir -p /data/camera-monitor/fotos && tar -C /data/camera-monitor -xzf -'
-ssh echo 'chown -R 10002:10002 /data/camera-monitor/fotos'  # o app roda sem root (uid 10002)
+./deploy-echo.sh
 ```
 
-O `.env` vai a parte, uma vez (`chmod 600`). Na primeira vez, e quando mudar
-`requirements-docker.txt` ou a versao do MediaMTX, monte a imagem base:
+O script compara o sha256 de cada arquivo do app com o que ja esta na Echo,
+manda so o que mudou e roda o `docker compose -f compose.echo.yaml --profile
+tunnel up -d --build` la. Quando muda `requirements-docker.txt` ou o
+`echo-deps.sh` (versao do MediaMTX, por exemplo), ele remonta antes a imagem
+base, o que leva alguns minutos. No fim confere tres coisas: o `server.py`
+dentro do container e o daqui, o `/favicon.svg` responde sem login e o
+`/healthz` diz `ok` (video chegando). Sem nada mudado, so confere. Os arquivos
+substituidos ficam em `/data/camera-monitor/.deploy-anterior/`: para voltar,
+copie de la para a pasta e rode o `up -d --build` de novo. O aviso de
+plataforma `linux/arm64/v8` contra `linux/arm/v8` no build e esperado.
 
-```bash
-ssh echo 'cd /data/camera-monitor && sh echo-deps.sh'
-```
-
-Depois, para subir ou atualizar (o aviso de plataforma `linux/arm64/v8` contra
-`linux/arm/v8` e esperado):
-
-```bash
-ssh echo 'cd /data/camera-monitor && docker compose -f compose.echo.yaml --profile tunnel up -d --build'
-```
+O `.env` nao vai pelo script: copie a parte, uma vez (`chmod 600`). O app roda
+sem root (uid 10002) e o script deixa `fotos/` com esse dono.
 
 Sem o profile `tunnel` sobe so o monitor. No painel do Cloudflare Tunnel, o
 hostname aponta para `HTTP` `camera-monitor:8090`, como no `compose.yaml`. O
-deploy automatico do CI e so para o Pi; a Echo se atualiza com os comandos
-acima.
+deploy automatico do CI e so para o Pi.
+
+O `compose.echo.yaml` fixa o DNS dos containers no roteador (`dns:`): depois
+de uma queda de energia o dockerd sobe antes do DHCP do Wi-Fi, e sem isso o
+app nao baixa as chaves do Cloudflare Access (painel em 403). Troque o IP pelo
+do seu roteador.
 
 ## Cloudflare Tunnel
 
@@ -335,10 +341,15 @@ Para exigir uma conta ou e-mail especifico, configure tambem uma aplicacao em **
 
 ## Notificacoes no celular
 
-Com `NTFY_URL` definido, cada alerta vira um push no app [ntfy](https://ntfy.sh)
-(Android/iOS) com a foto ja anotada, prioridade alta e, se `PUBLIC_URL` estiver
+Com `NTFY_URL` definido, cada visita vira um push no app [ntfy](https://ntfy.sh)
+(Android/iOS) com a foto, prioridade alta e, se `PUBLIC_URL` estiver
 definido, toque e botao "Ao vivo" abrindo o painel. O envio roda em thread
 propria: internet lenta nao segura o video.
+
+Uma visita comeca no primeiro alerta e acaba quando a pessoa (ou bicho) some
+por `VISITA_FIM_S` (90 s). Enquanto ela fica, entra mais uma foto a cada 20 s,
+sem push; no painel a visita aparece uma vez, com o link "+N fotos". Antes
+era um push a cada 20 s: na Echo, uma pessoa 12 min no portao mandou 35.
 
 1. Gere um topico aleatorio, por exemplo `camera-$(openssl rand -hex 8)`.
 2. Coloque `NTFY_URL=https://ntfy.sh/<topico>` no `.env`.
@@ -347,6 +358,34 @@ propria: internet lenta nao segura o video.
 
 Quem souber o nome do topico recebe as fotos: trate-o como senha. O push leva
 uma foto, nao video; o ao vivo e o link.
+
+### Modo em casa
+
+No cabecalho do painel:
+
+- **Push sempre**: o normal.
+- **Em casa: sem push**: as fotos e o historico continuam; o celular fica quieto.
+- **Em casa no horario**: sem push so entre os dois horarios (pode virar a
+  meia-noite, ex.: 22:00 as 07:00). Fora dele, push normal.
+
+Os avisos de saude do video ("Camera sem imagem", "Video instavel") vao sempre.
+A visita que chegou em casa aparece com 🏠 no painel. O modo fica em
+`fotos/.modo.json` e sobrevive a reiniciar.
+
+### Heartbeat: aviso quando o aparelho cai
+
+O push "Camera sem imagem" sai do proprio aparelho: se a Echo (ou o Pi)
+desligar, travar ou perder o Wi-Fi, ninguem avisa. Com `HEARTBEAT_URL`, o app
+faz um GET nessa URL a cada 5 min enquanto o video chega; quando os pings
+param, o servico de fora avisa. Com o [healthchecks.io](https://healthchecks.io)
+(gratis):
+
+1. Crie um check com *Period* 5 min e *Grace* 10 min.
+2. Em *Integrations*, ligue o ntfy com o mesmo topico do `NTFY_URL` (ou e-mail).
+3. Coloque a URL de ping do check em `HEARTBEAT_URL` no `.env` e suba de novo.
+
+Video parado tambem para os pings, entao camera fora do ar avisa pelos dois
+caminhos.
 
 ## Controle PTZ
 
@@ -378,6 +417,29 @@ curl -u admin:senha -X POST http://localhost:8090/ptz/cima
 
 A camera precisa aceitar o endpoint ONVIF configurado em `ptz.py`. O firmware pode limitar o tilt mesmo quando aceita o comando.
 
+## Video em HD
+
+O botao **HD** do painel troca o MJPEG (o substream que o aparelho decodifica
+para a deteccao, 640x360 na Echo) pelo stream principal da camera, 1080p, em
+HLS. O MediaMTX so copia o H.265 para o HLS, sem decodificar: na Echo o custo
+e repassar ~300 kbps. Ele puxa o stream principal da camera so enquanto alguem
+assiste em HD e solta um minuto depois. Enquanto o HD esta ligado, o MJPEG
+fecha e o aparelho deixa de gerar JPEG.
+
+- O HLS chega alguns segundos atrasado. As caixas sao desenhadas por cima num
+  canvas, com a analise do instante que esta na tela (hora do quadro analisado
+  no `/status` contra o `PROGRAM-DATE-TIME` do HLS).
+- Precisa de navegador que toque H.265: Chrome e Edge com decodificacao por
+  hardware, e Safari. No Firefox (e onde nao houver suporte) o botao fica
+  apagado, com o motivo no titulo, e o MJPEG continua.
+- O player e o [hls.js](https://github.com/video-dev/hls.js), carregado do
+  jsDelivr so quando o HD liga, com versao fixa e hash SRI: se o arquivo do
+  CDN mudar, o navegador recusa.
+- Sai do caminho do audio quando ha `CAM_AUDIO_PATH` (o principal), ou do
+  `CAM_PATH`. O HLS do MediaMTX escuta so no loopback do container; o app
+  repassa em `/hd/` com o login do painel. Em WSL2 (MediaMTX no Windows) nao
+  ha HD.
+
 ## Endpoints uteis
 
 | Endpoint | Funcao |
@@ -386,17 +448,24 @@ A camera precisa aceitar o endpoint ONVIF configurado em `ptz.py`. O firmware po
 | `/stream` | Stream MJPEG anotado |
 | `/audio` | Audio PCM da camera |
 | `/status` | Estado, deteccoes e eventos |
-| `/healthz` | Healthcheck interno |
+| `/healthz` | Healthcheck interno; sempre 200, com `ok`, `aguardando vídeo` ou `sem vídeo há N s` |
 | `/test` | Notificacao de teste (desktop e celular) |
 | `/ptz/<direcao>` | Movimento PTZ |
 | `/posicoes` | Lista as posicoes salvas |
 | `/posicoes/<nome>` | `PUT` salva a atual, `POST` vai ate ela, `DELETE` apaga |
 | `/fotos/<nome>` | Fotos dos alertas |
 | `/historico` | Todas as fotos de alerta, por dia, com filtro e zoom (botao **Historico** no painel) |
-| `/historico.json` | Lista das fotos: nome, dia, hora e tipo |
+| `/historico.json` | Lista das fotos: nome, dia, hora, tipo, visita e rotulo |
+| `/rotulos` | `POST` `{"fotos": [...], "rotulo": "real"\|"falso"\|null}` marca alerta certo ou falso alarme |
+| `/modo` | `GET` mostra, `POST` `{"modo": "armado"\|"em_casa"\|"horario", "inicio", "fim"}` muda o modo em casa |
+| `/hd/<arquivo>` | HLS do modo HD (repassado do MediaMTX) |
 | `/favicon.svg` | Icone da aba do navegador (tambem em `/favicon.ico`) |
 
-Todos os endpoints, exceto `/healthz` e o icone, exigem autenticacao Basic. O
+Todos os endpoints, exceto `/healthz` e o icone, exigem autenticacao Basic. Os
+que mudam algo (`POST`, `PUT`, `DELETE` e o `/test`) recusam pedido vindo de
+outro site (cabecalho `Sec-Fetch-Site`, ou `Origin` em navegador antigo): uma
+pagina maliciosa aberta por quem esta logado nao consegue virar a camera. `curl`
+nao manda esses cabecalhos e continua funcionando. O
 icone e um SVG dentro do `server.py` (constante `FAVICON`): para trocar, edite
 ali; nao ha arquivo de imagem para copiar no deploy.
 
@@ -457,6 +526,9 @@ No Raspberry Pi:
     do quadro, com confianca de 0,25-0,53. Caixa que encosta nas duas bordas
     so avisa a partir de 0,6; pessoa colada na camera passa de 0,8.
 
+  Marque os falsos alarmes no historico: o `test_detect.py` mostra quantos os
+  filtros de hoje barram, e se algum ajuste passou a perder alerta certo.
+
 - **Falar pela camera (audio bidirecional):** nao suportado. A camera (Yoosee)
   anuncia `AudioOutputs = 0` no ONVIF; o alto-falante so e acessivel pelo
   protocolo proprietario do app Yoosee.
@@ -468,18 +540,31 @@ No Raspberry Pi:
 
 ## Testes
 
-Validar sintaxe:
+O CI roda a sintaxe e o `_selfcheck` do `server.py`, que testa sem camera as
+visitas, o carro parado, os filtros de pessoa, o modo em casa, o heartbeat, o
+CSRF, o PTZ pela imagem e o audio:
 
 ```bash
-python3 -m py_compile server.py config.py ptz.py
-bash -n start.sh start-mediamtx.sh
+python3 -m py_compile server.py config.py ptz.py test_detect.py
+CAM_HOST=x CAM_USER=x CAM_PASS=x python3 -c "import server; server._selfcheck()"
+bash -n start.sh start-mediamtx.sh docker-entrypoint.sh deploy-echo.sh
 ```
 
-O teste de deteccao usa fotos de referencia privadas em `fotos/` ou `teste/`, quando disponiveis:
+O teste da deteccao usa os alertas marcados no historico (botoes **alerta
+certo** / **falso alarme** no zoom, teclas `c` e `f`; ficam em
+`fotos/rotulos.json`). Ele falha se algum alerta certo deixar de alertar e
+conta quantos falsos alarmes os filtros de hoje barram:
 
 ```bash
-python3 test_detect.py
+mkdir -p /tmp/echo && ssh echo 'tar -C /data/camera-monitor -cf - fotos' | tar -C /tmp/echo -xf -
+python3 test_detect.py /tmp/echo/fotos            # filtros, nas caixas gravadas
+python3 test_detect.py /tmp/echo/fotos --modelo   # tambem roda o modelo nas fotos
 ```
+
+A parte dos filtros reaplica `descartar()` nas caixas que o detector gravou no
+`eventos.jsonl` na hora do alerta: o resultado nao depende da recompressao do
+JPEG. O `--modelo` roda o detector de novo nas fotos, que e o jeito de comparar
+modelos e limiares.
 
 ## Estrutura
 
@@ -495,12 +580,14 @@ compose.pi.yaml           Monitor no Raspberry Pi (standalone)
 compose.echo.yaml         Monitor e tunnel na Echo Show (standalone)
 compose.wsl.yaml          Overlay para WSL2, com o MediaMTX no host Windows
 deploy-pi.sh              Comando forcado do deploy automatico no Pi
+deploy-echo.sh            Instala/atualiza a Echo Show por SSH e confere o resultado
+test_detect.py            Confere a deteccao contra os alertas marcados no historico
 echo-deps.sh              Monta a imagem base arm64 na Echo Show
 seccomp-echo.json         Perfil seccomp com a ABI aarch64, para o Docker armhf da Echo
 docker-entrypoint.sh      Inicializa MediaMTX e o servidor Python
 start-mediamtx-windows.ps1  Relay MediaMTX no host Windows, so para WSL2
 .env.exemplo              Modelo de configuracao local
-fotos/                    Fotos privadas dos eventos e historico (eventos.jsonl)
+fotos/                    Fotos dos alertas, eventos.jsonl, rotulos.json, .modo.json e .presets/ (privado)
 MobileNetSSD_deploy.*     Modelo MobileNet-SSD e configuracao Caffe
 ```
 
@@ -511,3 +598,5 @@ MobileNetSSD_deploy.*     Modelo MobileNet-SSD e configuracao Caffe
 - Prefira Cloudflare Access para restringir o dominio a usuarios autorizados.
 - Revogue tokens que tenham sido compartilhados em chats, terminais ou commits antigos.
 - Use um topico ntfy aleatorio: ele e a unica protecao das fotos enviadas ao celular.
+- Pedidos que mudam algo so valem vindos do proprio painel (ou de `curl`): ver
+  `outro_site()` no `server.py`.

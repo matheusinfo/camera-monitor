@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Um push por visita, nao um a cada 20 s: o 1o alerta abre a visita; enquanto a pessoa (ou bicho) continua aparecendo, sem sumir por mais de `VISITA_FIM_S` (90 s), entra mais uma foto a cada 20 s, sem push. Na Echo uma pessoa 12 min no portao mandou 35 pushes. O painel mostra a visita uma vez, com "+N fotos"; o historico mostra um card por visita (as fotos de antes juntam pela hora, com a mesma regra).
+- Marcacao de alerta certo / falso alarme no historico (zoom, teclas `c` e `f`), em `fotos/rotulos.json`. O `test_detect.py` foi refeito em cima dela: reaplica os filtros de hoje nas caixas gravadas no `eventos.jsonl` (resultado estavel) e, com `--modelo`, roda o detector de novo nas fotos. Falha se algum alerta certo deixar de alertar. O `eventos.jsonl` passa a gravar a visita e o tamanho do quadro.
+- CI roda o `_selfcheck` do `server.py` (antes so `py_compile`).
+- Modo em casa no painel: sem push sempre, ou so num horario (pode virar a meia-noite); fotos e historico continuam. Os avisos de saude do video vao sempre.
+- Video em HD (botao **HD**): o stream principal em HLS, copiado pelo MediaMTX sem decodificar, repassado pelo app com o login do painel. Caixas da deteccao num canvas, sincronizadas pelo `PROGRAM-DATE-TIME`. Precisa de navegador com H.265 (Chrome/Edge com hardware, Safari); sem isso o botao fica apagado. Enquanto o HD esta ligado o MJPEG fecha. O MediaMTX deixou de abrir RTMP, SRT e WebRTC, que nao eram usados.
+- `HEARTBEAT_URL`: GET a cada 5 min enquanto o video chega (healthchecks.io e afins). Se o aparelho cair, o servico de fora avisa.
+- `/healthz` diz o estado do video (`ok`, `aguardando vídeo`, `sem vídeo há N s`), sempre com 200.
+- Pedidos que mudam algo (`POST`/`PUT`/`DELETE` e `/test`) vindos de outro site sao recusados (`Sec-Fetch-Site`/`Origin`): uma pagina maliciosa aberta por quem esta logado nao vira mais a camera.
+- `deploy-echo.sh`: atualiza a Echo mandando so os arquivos que mudaram, remonta a imagem base quando precisa e confere o `server.py` no container, o icone e o video. Guarda os arquivos substituidos em `.deploy-anterior/`.
+- `compose.echo.yaml` com o DNS fixo que so existia na Echo (apos queda de energia o app ficava sem DNS e o painel em 403).
+
 - Foto e push do alerta saem limpos, sem a caixa e a porcentagem por cima da pessoa; o video ao vivo continua marcado. A caixa e a confianca de cada alerta ficam em `fotos/eventos.jsonl`, que nao e mais cortado ao reiniciar (o painel segue com os 10 mais recentes).
 - Painel mostra so os 10 alertas mais recentes. Todas as fotos ficam na nova pagina `/historico` (botao **Historico**): agrupadas por dia, com filtro por dia e por tipo e zoom com setas. A lista sai da pasta `fotos/`, entao inclui as fotos que ja tinham saido do painel.
 - Titulo do painel mostra onde o monitor roda pela variavel `PAINEL_LOCAL` (`Echo Show` na Echo); antes era sempre "Raspberry Pi".

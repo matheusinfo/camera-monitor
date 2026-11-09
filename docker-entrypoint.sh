@@ -23,7 +23,13 @@ port = os.environ.get('CAM_RTSP_PORT', '554')
 path = os.environ.get('CAM_PATH', 'onvif1').lstrip('/')
 url = f'rtsp://{user}:{password}@{host}:{port}/{path}'
 with open('/tmp/mediamtx.yml', 'w', encoding='ascii') as config:
-    config.write('logLevel: info\npaths:\n  camera:\n')
+    config.write('logLevel: info\n')
+    # HLS do modo HD do painel: so no loopback, o app repassa com o login dele.
+    # O MediaMTX so copia o H.265 (nao decodifica) e so enquanto alguem assiste.
+    # RTMP, SRT e WebRTC nao sao usados: desligados.
+    config.write('hls: yes\nhlsAddress: 127.0.0.1:8888\n')
+    config.write('rtmp: no\nsrt: no\nwebrtc: no\n')
+    config.write('paths:\n  camera:\n')
     config.write(f'    source: {url}\n')
     config.write('    rtspTransport: udp\n')
     # Substream sem audio (onvif2): o audio vem de outro caminho da camera, e so
@@ -52,7 +58,11 @@ done
 
 export MEDIAMTX_URL="rtsp://127.0.0.1:8554/camera"
 export AUDIO_RTSP_URL="$MEDIAMTX_URL"
+export HLS_URL="http://127.0.0.1:8888/camera"
 if [ -n "${CAM_AUDIO_PATH:-}" ]; then
+    # Substream na deteccao: o caminho do audio e o stream principal (1080p),
+    # entao o HD sai dele.
     export AUDIO_RTSP_URL="rtsp://127.0.0.1:8554/audio"
+    export HLS_URL="http://127.0.0.1:8888/audio"
 fi
 exec gunicorn -c gunicorn.conf.py server:app

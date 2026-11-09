@@ -22,10 +22,19 @@ jobs:
         run: pip install -r requirements-docker.txt
 
       - name: Validate Python
-        run: python -m py_compile server.py config.py ptz.py
+        run: python -m py_compile server.py config.py ptz.py test_detect.py
+
+      # Testes do server.py sem camera: visitas, carro parado, filtros de
+      # pessoa, modo em casa, heartbeat, CSRF, PTZ pela imagem, audio etc.
+      - name: Self-check
+        env:
+          CAM_HOST: ci
+          CAM_USER: ci
+          CAM_PASS: ci
+        run: python -c "import server; server._selfcheck()"
 
       - name: Validate shell scripts
-        run: bash -n start.sh start-mediamtx.sh docker-entrypoint.sh
+        run: bash -n start.sh start-mediamtx.sh docker-entrypoint.sh deploy-echo.sh deploy-pi.sh
 
       - name: Validate Compose
         run: |

@@ -30,6 +30,10 @@ services:
     # fotos/ precisa ser do 10002: chown -R 10002:10002 fotos
     user: "10002:10002"
     group_add: ["3003"]
+    # DNS fixo: apos queda de energia o dockerd sobe antes do DHCP do Wi-Fi, o
+    # /etc/resolv.conf do host ainda esta vazio e o DNS interno do Docker fica
+    # sem servidor externo (sem isso o app nao baixa as chaves do Access -> 403).
+    dns: ["192.168.15.1"]
     cap_drop: [ALL]
     security_opt:
       - seccomp=./seccomp-echo.json
@@ -64,6 +68,10 @@ services:
     restart: unless-stopped
     # A imagem roda como nonroot: precisa do grupo 3003 para abrir sockets.
     group_add: ["3003"]
+    # DNS fixo: apos queda de energia o dockerd sobe antes do DHCP do Wi-Fi, o
+    # /etc/resolv.conf do host ainda esta vazio e o DNS interno do Docker fica
+    # sem servidor externo (sem isso o app nao baixa as chaves do Access -> 403).
+    dns: ["192.168.15.1"]
     depends_on:
       camera-monitor:
         condition: service_healthy

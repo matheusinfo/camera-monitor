@@ -19,6 +19,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from collections import deque
 from email.header import Header
@@ -59,6 +60,9 @@ CF_ACCESS_TEAM = os.environ.get("CF_ACCESS_TEAM", "")  # <team>.cloudflareaccess
 CF_ACCESS_AUD = os.environ.get("CF_ACCESS_AUD", "")    # Application Audience (AUD) tag
 NTFY_URL = os.environ.get("NTFY_URL", "")  # push no celular: https://ntfy.sh/<tópico-secreto>
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "")  # tocar no push abre o ao vivo
+# HLS do MediaMTX com o stream principal (1080p) só copiado, sem decodificar
+# aqui: o modo HD do painel. O docker-entrypoint.sh define; vazio = sem HD.
+HLS_URL = os.environ.get("HLS_URL", "")
 FOTOS_DIR = "fotos"            # snapshot anotado de cada notificação
 # Histórico do painel junto das fotos, no mesmo volume: sobrevive a reiniciar o
 # container ou o aparelho (antes era só memória e o painel voltava vazio).
@@ -104,7 +108,18 @@ PESSOA_BASE_MIN = float(os.environ.get("PESSOA_BASE_MIN") or "0.7")
 # noite no IR e de dia). Pessoa de verdade, até de corpo inteiro no portão, não
 # encosta nas duas bordas; colada na câmera, sai acima de 0,8.
 PESSOA_ALTA_MIN = 0.6
-NOTIFY_COOLDOWN_S = 20         # antispam de toast, por categoria
+# Visita: o 1º alerta de uma categoria abre a visita e manda o push; enquanto
+# ela continuar aparecendo, sem sumir por mais de VISITA_FIM_S, entra mais uma
+# foto a cada FOTO_VISITA_S, sem push. Antes era um push a cada 20 s: na Echo
+# (2026-11) 300 fotos vieram de 123 visitas, e uma de 12 min mandou 35 pushes.
+VISITA_FIM_S = int(os.environ.get("VISITA_FIM_S") or "90")
+FOTO_VISITA_S = 20
+# Heartbeat: GET nesta URL a cada HEARTBEAT_S enquanto o vídeo chega (ex.: um
+# check do healthchecks.io). Se a Echo desligar, travar ou perder a rede, os
+# pings param e o serviço avisa: o push "Câmera sem imagem" sai daqui mesmo e
+# não chega nesses casos. Vazio desliga.
+HEARTBEAT_URL = os.environ.get("HEARTBEAT_URL", "")
+HEARTBEAT_S = 300
 # nº de análises seguidas antes de notificar. No Pi 3 cada análise leva ~4,5s:
 # com 3 para pessoa, quem para alguns segundos no portão nunca notificava. O 3
 # fica para animal, que é onde o modelo alucina (carro/grade vira "pássaro").
@@ -154,36 +169,95 @@ app = Flask(__name__)
 state = {
     "jpeg": None,               # último frame anotado (bytes)
     "detections": [],           # detecções do último frame analisado
-    "events": deque(maxlen=EVENTS_MAX), # histórico de notificações
+    "events": deque(maxlen=EVENTS_MAX), # visitas no painel (todas em /historico)
     "connected": False,
     "espectadores": 0,          # conexões abertas em /stream
-    "last_notify": {},          # categoria -> timestamp
 }
 lock = threading.Lock()
 
 
-def load_events():
-    """Põe os EVENTS_MAX mais recentes no painel. O arquivo fica inteiro: guarda
-    as caixas e a confiança de cada alerta, que a foto não mostra mais."""
+def ler_eventos(arquivo=None):
+    """Linhas do eventos.jsonl, uma por foto de alerta, da mais antiga à mais
+    nova; None se o arquivo não existe."""
     try:
-        with open(EVENTS_FILE, encoding="utf-8") as f:
+        with open(arquivo or EVENTS_FILE, encoding="utf-8") as f:
             linhas = f.read().splitlines()
     except FileNotFoundError:
-        return
+        return None
     eventos = []
     for linha in linhas:
         try:
             eventos.append(json.loads(linha))
         except ValueError:
             pass  # linha pela metade de um desligamento no meio da escrita
-    for ev in eventos[-EVENTS_MAX:]:
-        state["events"].appendleft({k: v for k, v in ev.items() if k != "dets"})
+    return eventos
+
+
+def painel_adiciona(ev):
+    """Lista do painel: uma linha por visita, com o total de fotos dela. Chamar
+    com o lock (ou antes das threads subirem)."""
+    for e in state["events"]:
+        if e.get("visita") == ev["visita"]:
+            e["fotos"] = e.get("fotos", 1) + 1
+            return
+    state["events"].appendleft(dict(ev, fotos=1))
+
+
+def load_events():
+    """Põe as EVENTS_MAX visitas mais recentes no painel. O arquivo fica inteiro:
+    guarda as caixas e a confiança de cada foto, que ela não mostra."""
+    eventos = ler_eventos()
+    if eventos is None:
+        return
+    for ev in eventos:
+        ev_painel = {k: v for k, v in ev.items() if k not in ("dets", "quadro")}
+        # linhas de antes das visitas (2026-11-09): cada foto é uma visita
+        ev_painel.setdefault("visita", (ev.get("photo") or "")[:-4] or ev.get("time"))
+        painel_adiciona(ev_painel)
     with open(EVENTS_FILE + ".tmp", "w", encoding="utf-8") as f:
         f.writelines(json.dumps(ev, ensure_ascii=False) + "\n" for ev in eventos)
     os.replace(EVENTS_FILE + ".tmp", EVENTS_FILE)
 
 
 load_events()
+
+
+# Modo "em casa": as fotos continuam, o push no celular não. "horario" = em
+# casa só entre inicio e fim (pode virar a meia-noite, ex.: 22:00-07:00). Fica
+# em fotos/, no volume, para sobreviver a reiniciar; muda pelo painel.
+MODO_JSON = os.path.join(FOTOS_DIR, ".modo.json")
+HORA_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+modo = {"modo": "armado", "inicio": "07:00", "fim": "22:00"}
+
+
+def modo_valido(d):
+    """O modo pedido, completo, ou None se veio algo errado."""
+    if not isinstance(d, dict) or d.get("modo") not in ("armado", "em_casa", "horario"):
+        return None
+    novo = dict(modo, modo=d["modo"])
+    for k in ("inicio", "fim"):
+        if k in d:
+            if not isinstance(d[k], str) or not HORA_RE.fullmatch(d[k]):
+                return None
+            novo[k] = d[k]
+    return novo
+
+
+try:
+    with open(MODO_JSON, encoding="utf-8") as f:
+        modo.update(modo_valido(json.load(f)) or {})
+except (OSError, ValueError):
+    pass
+
+
+def push_ligado(agora=None):
+    """Manda push de alerta agora? Os de saúde do vídeo vão sempre."""
+    if modo["modo"] != "horario":
+        return modo["modo"] == "armado"
+    hm = time.strftime("%H:%M", time.localtime(agora))
+    ini, fim = modo["inicio"], modo["fim"]
+    em_casa = ini <= hm < fim if ini <= fim else (hm >= ini or hm < fim)
+    return not em_casa
 
 if CF_ACCESS_TEAM and CF_ACCESS_AUD:
     import jwt
@@ -201,10 +275,27 @@ def cf_access_ok():
         return False
 
 
+def outro_site():
+    """Pedido que muda algo (PTZ, posições, modo, rótulos, /test) vindo de outra
+    página? O navegador manda o login Basic (e o cookie do Access) junto de um
+    form ou fetch de qualquer site: sem isto, uma página maliciosa aberta por
+    quem está logado poderia virar a câmera para o lado. curl não manda
+    Sec-Fetch-Site nem Origin e passa."""
+    if request.method in ("GET", "HEAD", "OPTIONS") and request.path != "/test":
+        return False
+    site = request.headers.get("Sec-Fetch-Site")
+    if site is not None:
+        return site not in ("same-origin", "none")
+    origem = request.headers.get("Origin")   # navegador antigo, sem Sec-Fetch-*
+    return bool(origem) and urlsplit(origem).netloc != request.host
+
+
 @app.before_request
 def require_login():
     if request.path in ("/healthz", "/favicon.svg", "/favicon.ico"):
         return None
+    if outro_site():
+        return "pedido de outro site recusado", 403
     if CF_ACCESS_TEAM and CF_ACCESS_AUD and "Cf-Access-Jwt-Assertion" in request.headers:
         return None if cf_access_ok() else ("acesso pelo Cloudflare Access", 403)
     auth = request.authorization
@@ -218,7 +309,13 @@ def require_login():
 
 @app.route("/healthz")
 def healthz():
-    return "ok"
+    """Sempre 200 (o healthcheck do Docker só quer saber se o app responde; o
+    cloudflared espera por ele), com o estado do vídeo no texto: o
+    deploy-echo.sh espera o "ok"."""
+    parado = int(time.time() - saude["ultimo_quadro"])
+    if parado > 15:
+        return f"sem vídeo há {parado} s"
+    return "ok" if state["connected"] else "aguardando vídeo"
 
 
 def phone_notify(title, msg, jpg=None):
@@ -273,41 +370,54 @@ def pessoa_ignorada(box, conf, H, fundo):
     return None
 
 
-def detect_view(frame, x0, y0, size_w, size_h, veiculos=True):
-    """Roda o MobileNet num recorte e devolve as caixas em coordenadas do frame.
-
-    veiculos=False ignora carro/ônibus/moto: são grandes, o quadro inteiro já os
-    vê, e no recorte a caixa sai cortada (mudaria de lugar entre análises)."""
-    H, W = frame.shape[:2]
-    view = frame[y0:y0 + size_h, x0:x0 + size_w]
+def inferir(view):
+    """MobileNet-SSD num recorte: [(classe, conf, x1, y1, x2, y2)] em px do recorte."""
+    h, w = view.shape[:2]
     blob = cv2.dnn.blobFromImage(cv2.resize(view, (300, 300)),
                                  0.007843, (300, 300), 127.5)
     net.setInput(blob)
     out = net.forward()
+    return [(VOC_CLASSES[int(o[1])], float(o[2]), *(o[3:7] * (w, h, w, h)))
+            for o in out[0, 0]]
+
+
+def descartar(cat, conf, box, W, H, fundo):
+    """Motivo para a caixa (px do quadro W x H) não alertar, ou None. fundo:
+    borda de baixo do recorte analisado. Também serve para o test_detect.py
+    reaplicar os filtros de hoje nas caixas gravadas no eventos.jsonl."""
+    area = (box[2] - box[0]) * (box[3] - box[1]) / (W * H)
+    if cat == "veiculo" and area > MAX_CARRO_AREA:
+        return "quadro inteiro"
+    if cat == "pessoa":
+        motivo = pessoa_ignorada(box, conf, H, fundo)
+        if motivo:
+            return motivo
+    if conf < CONFIDENCE_MIN[cat]:
+        return "abaixo do limiar"
+    if cat == "animal" and area > MAX_ANIMAL_AREA:
+        return "grande demais"
+    return None
+
+
+def detect_view(frame, x0, y0, size_w, size_h, veiculos=True):
+    """Roda o modelo num recorte e devolve as caixas em coordenadas do frame.
+
+    veiculos=False ignora carro/ônibus/moto: são grandes, o quadro inteiro já os
+    vê, e no recorte a caixa sai cortada (mudaria de lugar entre análises)."""
+    H, W = frame.shape[:2]
     found = []
-    for i in range(out.shape[2]):
-        conf = float(out[0, 0, i, 2])
-        cls = VOC_CLASSES[int(out[0, 0, i, 1])]
+    for cls, conf, *xyxy in inferir(frame[y0:y0 + size_h, x0:x0 + size_w]):
         cat = CATEGORY.get(cls)
         if cat is None or (cat == "veiculo" and not veiculos):
             continue
         if conf < min(0.2, CONFIDENCE_MIN[cat]):
             continue
-        box = out[0, 0, i, 3:7] * np.array([size_w, size_h, size_w, size_h])
-        box += np.array([x0, y0, x0, y0])
-        area = (box[2] - box[0]) * (box[3] - box[1]) / (W * H)
-        motivo = None
-        if cat == "veiculo" and area > MAX_CARRO_AREA:
-            motivo = "quadro inteiro"
-        elif cat == "pessoa":
-            motivo = pessoa_ignorada(box, conf, H, y0 + size_h)
+        box = np.array(xyxy) + (x0, y0, x0, y0)
+        motivo = descartar(cat, conf, box, W, H, y0 + size_h)
         if cat != "animal":   # no log: para calibrar o limiar
             print(f"{LABELS_PT[cls].lower()} {conf:.2f}"
-                  f"{f' ({motivo}, ignorado)' if motivo else ''}"
-                  f"{'' if conf >= CONFIDENCE_MIN[cat] else ' (abaixo do limiar)'}", flush=True)
-        if conf < CONFIDENCE_MIN[cat] or motivo:
-            continue
-        if cat == "animal" and area > MAX_ANIMAL_AREA:
+                  f"{f' ({motivo}, ignorado)' if motivo else ''}", flush=True)
+        if motivo:
             continue
         found.append({"label": LABELS_PT[cls], "category": cat,
                       "confidence": round(conf, 2),
@@ -371,32 +481,42 @@ def drop_static(dets, now=None):
 
 
 streaks = {}
+visitas = {}  # categoria -> {"id", "visto", "foto"} da visita aberta
+TITULOS = {"pessoa": "Pessoa detectada!", "animal": "Animal detectado!"}
 
 
-def maybe_notify(dets):
-    """Notifica só quando a categoria persiste por STREAK_MIN análises seguidas.
+def maybe_notify(dets, now=None):
+    """Abre a visita quando a categoria persiste por STREAK_MIN análises
+    seguidas; com ela aberta, pede uma foto a cada FOTO_VISITA_S.
 
-    Devolve os eventos disparados (sem foto ainda; capture_loop anexa)."""
+    now: hora do quadro analisado (o id da visita é o nome da 1ª foto). Devolve
+    os eventos sem foto (save_events anexa); "nova" = abriu a visita agora, e
+    só esses mandam push."""
+    now = time.time() if now is None else now
     fired = []
-    now = time.time()
     by_cat = {}
     for d in dets:
         by_cat.setdefault(d["category"], []).append(d["label"])
     for cat in list(streaks):
         if cat not in by_cat:
             streaks[cat] = 0
+    for cat in [c for c, v in visitas.items() if now - v["visto"] > VISITA_FIM_S]:
+        del visitas[cat]                       # sumiu: a próxima é visita nova
     for cat, labels in by_cat.items():
         streaks[cat] = streaks.get(cat, 0) + 1
         if streaks[cat] < STREAK_MIN[cat]:
             continue
-        if now - state["last_notify"].get(cat, 0) < NOTIFY_COOLDOWN_S:
-            continue
-        state["last_notify"][cat] = now
-        titulo = "Pessoa detectada!" if cat == "pessoa" else "Animal detectado!"
-        msg = f"Câmera: {', '.join(sorted(set(labels)))} em cena."
-        desktop_notify(titulo, msg)
-        fired.append({"time": time.strftime("%H:%M:%S"), "title": titulo,
-                      "msg": msg, "cat": cat})
+        v, nova = visitas.get(cat), cat not in visitas
+        if nova:
+            v = visitas[cat] = {"visto": now, "foto": now, "id":
+                                f"{time.strftime('%Y%m%d_%H%M%S', time.localtime(now))}_{cat}"}
+        else:
+            v["visto"] = now
+            if now - v["foto"] < FOTO_VISITA_S:
+                continue
+            v["foto"] = now
+        fired.append({"title": TITULOS[cat], "cat": cat, "visita": v["id"], "nova": nova,
+                      "msg": f"Câmera: {', '.join(sorted(set(labels)))} em cena."})
     return fired
 
 
@@ -432,8 +552,7 @@ def vigia_carros(carros, now=None):
     if not avisar:
         return []
     msg = f"Câmera: {', '.join(sorted(set(avisar)))} parado há {CARRO_PARADO_S} s."
-    return [{"time": time.strftime("%H:%M:%S"), "title": "Carro parado!",
-             "msg": msg, "cat": "veiculo"}]
+    return [{"title": "Carro parado!", "msg": msg, "cat": "veiculo", "nova": True}]
 
 
 def kill_video(proc=None):
@@ -572,7 +691,7 @@ def y4m_frames(stream):
         yield np.frombuffer(data, np.uint8).reshape(h * 3 // 2, w)
 
 
-detect_slot = {"frame": None, "ts": 0.0, "dets": []}
+detect_slot = {"frame": None, "ts": 0.0, "dets": [], "dets_ts": 0.0}
 detect_ready = threading.Event()
 
 
@@ -591,26 +710,37 @@ def save_events(fired, frame, ts, dets):
 
     Em CPU lenta (Echo Show: segundos por análise) o quadro do momento em que a
     análise termina já não tem a pessoa. A foto vai limpa, sem caixa nem
-    porcentagem por cima; caixas e confiança ficam no eventos.jsonl (para
-    calibrar a detecção)."""
+    porcentagem por cima; caixas, confiança e o tamanho do quadro ficam no
+    eventos.jsonl (para calibrar a detecção). Push e toast só na foto que abre
+    a visita, e o push não sai no modo em casa."""
     if not fired:
         return
     ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
     if not ok:
         return
+    jpg = jpg.tobytes()
     stamp = time.localtime(ts)
+    H, W = frame.shape[:2]
+    push = push_ligado(ts)
     for ev in fired:
+        nova = ev.pop("nova")
         ev["time"] = time.strftime("%d/%m %H:%M:%S", stamp)
         ev["photo"] = f"{time.strftime('%Y%m%d_%H%M%S', stamp)}_{ev.pop('cat')}.jpg"
+        ev.setdefault("visita", ev["photo"][:-4])
         with open(os.path.join(FOTOS_DIR, ev["photo"]), "wb") as f:
-            f.write(jpg.tobytes())
-        phone_notify(ev["title"], ev["msg"], jpg.tobytes())
+            f.write(jpg)
+        if nova:
+            desktop_notify(ev["title"], ev["msg"])
+            if push:
+                phone_notify(ev["title"], ev["msg"], jpg)
+            else:
+                ev["silencioso"] = True       # em casa: foto sem push
     with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-        f.writelines(json.dumps(dict(ev, dets=dets), ensure_ascii=False) + "\n"
-                     for ev in fired)
+        f.writelines(json.dumps(dict(ev, dets=dets, quadro=[W, H]), ensure_ascii=False)
+                     + "\n" for ev in fired)
     with lock:
         for ev in fired:
-            state["events"].appendleft(ev)
+            painel_adiciona(ev)
 
 
 def motion_thumb(frame):
@@ -652,14 +782,11 @@ def detect_loop():
         # drop_static o descartaria).
         carros = [d for d in todas if d["category"] == "veiculo"]
         dets = drop_static([d for d in todas if d["category"] != "veiculo"])
-        fired = maybe_notify(dets)  # sempre, para zerar streaks quando a cena esvazia
-        chegou = vigia_carros(carros)
-        for ev in chegou:
-            desktop_notify(ev["title"], ev["msg"])
-        fired += chegou
+        fired = maybe_notify(dets, ts)  # sempre, para zerar streaks quando a cena esvazia
+        fired += vigia_carros(carros, ts)
         dets += carros
         with lock:
-            detect_slot["dets"] = dets
+            detect_slot["dets"], detect_slot["dets_ts"] = dets, ts
         save_events(fired, frame, ts, dets)
         time.sleep(DETECT_INTERVAL_S)
 
@@ -689,12 +816,33 @@ def checar_saude(agora):
     return msgs
 
 
+def heartbeat_devido(agora):
+    """Hora de pingar o HEARTBEAT_URL? Só com vídeo chegando: Echo desligada,
+    sem rede, app travado ou câmera fora do ar param os pings do mesmo jeito."""
+    if not HEARTBEAT_URL or saude["sem_video"]:
+        return False
+    if agora - saude.get("ultimo_ping", 0.0) < HEARTBEAT_S:
+        return False
+    saude["ultimo_ping"] = agora
+    return True
+
+
+def pingar():
+    try:
+        urllib.request.urlopen(HEARTBEAT_URL, timeout=15).close()
+    except OSError as e:
+        print(f"heartbeat falhou: {e}", flush=True)
+
+
 def saude_loop():
     while True:
         time.sleep(10)
-        for titulo, msg in checar_saude(time.time()):
+        agora = time.time()
+        for titulo, msg in checar_saude(agora):
             print(f"saúde: {titulo} - {msg}", flush=True)
             phone_notify(titulo, msg)
+        if heartbeat_devido(agora):
+            threading.Thread(target=pingar, daemon=True).start()
 
 
 def capture_loop():
@@ -894,6 +1042,29 @@ def stream():
                     mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
+HD_ARQ = re.compile(r"[\w-]+(\.[\w]+)?")   # index.m3u8, *.mp4: sem / nem ..
+
+
+@app.route("/hd/<arq>")
+def hd(arq):
+    """Repassa o HLS do MediaMTX (só no loopback do container) com o login do
+    painel. O MediaMTX puxa o stream principal da câmera só enquanto alguém
+    assiste, e fecha um minuto depois do último pedido."""
+    if not HLS_URL or not HD_ARQ.fullmatch(arq):
+        return "sem HD", 404
+    url = f"{HLS_URL}/{arq}"
+    if request.query_string:          # _HLS_msn/_HLS_part do LL-HLS
+        url += "?" + request.query_string.decode()
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            corpo, tipo = r.read(), r.headers.get("Content-Type")
+    except urllib.error.HTTPError as e:
+        return Response(e.read(), e.code)
+    except OSError:
+        return "HD indisponível", 502
+    return Response(corpo, content_type=tipo, headers={"Cache-Control": "no-store"})
+
+
 @app.route("/fotos/<path:name>")
 def foto(name):
     return send_from_directory(FOTOS_DIR, name)
@@ -903,17 +1074,44 @@ def foto(name):
 FOTO_RE = re.compile(r"(\d{8})_(\d{6})_(pessoa|animal|veiculo)\.jpg")
 
 
+ROTULOS_JSON = os.path.join(FOTOS_DIR, "rotulos.json")  # foto -> "real" | "falso"
+rotulos_lock = threading.Lock()
+
+
+def ler_rotulos(arquivo=None):
+    try:
+        with open(arquivo or ROTULOS_JSON, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def historico():
-    """Todas as fotos de alerta, mais novas primeiro. A fonte é a pasta, não o
-    eventos.jsonl: ele é cortado em EVENTS_MAX e não tem as antigas."""
-    itens = []
-    for nome in os.listdir(FOTOS_DIR):
+    """Todas as fotos de alerta, com a visita de cada uma: visitas da mais nova
+    para a mais antiga, e as fotos de cada visita em ordem de hora. A fonte é a
+    pasta, não o eventos.jsonl: ele não tem as fotos antigas, nem a visita das
+    de antes de 2026-11-09. Essas juntam pela hora, com a regra de hoje: mesma
+    categoria, sem buraco maior que VISITA_FIM_S."""
+    visita_de = {ev["photo"]: ev["visita"] for ev in ler_eventos() or []
+                 if ev.get("visita") and ev.get("photo")}
+    rotulos = ler_rotulos()
+    itens, ultima, inicio = [], {}, {}
+    for nome in sorted(os.listdir(FOTOS_DIR)):
         m = FOTO_RE.fullmatch(nome)
-        if m:
-            d, h, cat = m.groups()
-            itens.append({"photo": nome, "dia": f"{d[:4]}-{d[4:6]}-{d[6:]}",
-                          "hora": f"{h[:2]}:{h[2:4]}:{h[4:]}", "cat": cat})
-    itens.sort(key=lambda i: i["photo"], reverse=True)
+        if not m:
+            continue
+        d, h, cat = m.groups()
+        v = visita_de.get(nome)
+        if v is None:
+            t = time.mktime(time.strptime(d + h, "%Y%m%d%H%M%S"))
+            ant = ultima.get(cat)
+            v = ant[1] if ant and t - ant[0] <= VISITA_FIM_S else nome[:-4]
+            ultima[cat] = (t, v)
+        inicio.setdefault(v, nome)
+        itens.append({"photo": nome, "dia": f"{d[:4]}-{d[4:6]}-{d[6:]}",
+                      "hora": f"{h[:2]}:{h[2:4]}:{h[4:]}", "cat": cat,
+                      "visita": v, "rotulo": rotulos.get(nome)})
+    itens.sort(key=lambda i: inicio[i["visita"]], reverse=True)  # estável
     return itens
 
 
@@ -927,12 +1125,52 @@ def historico_json():
     return jsonify(historico())
 
 
+@app.route("/rotulos", methods=["POST"])
+def rotular():
+    """Marca fotos como alerta certo ("real") ou falso alarme ("falso"); None
+    apaga. O test_detect.py usa isso para conferir os filtros e o modelo."""
+    d = request.get_json(silent=True) or {}
+    fotos, rotulo = d.get("fotos"), d.get("rotulo")
+    if (rotulo not in ("real", "falso", None) or not isinstance(fotos, list)
+            or not all(isinstance(f, str) and FOTO_RE.fullmatch(f) for f in fotos)):
+        return "pedido inválido", 400
+    with rotulos_lock:
+        rotulos = ler_rotulos()
+        for f in fotos:
+            if rotulo:
+                rotulos[f] = rotulo
+            else:
+                rotulos.pop(f, None)
+        with open(ROTULOS_JSON + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(rotulos, f, indent=0, sort_keys=True)
+        os.replace(ROTULOS_JSON + ".tmp", ROTULOS_JSON)
+    return "ok"
+
+
+@app.route("/modo", methods=["GET", "POST"])
+def modo_http():
+    if request.method == "POST":
+        novo = modo_valido(request.get_json(silent=True))
+        if novo is None:
+            return "modo inválido", 400
+        modo.update(novo)
+        with open(MODO_JSON + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(modo, f)
+        os.replace(MODO_JSON + ".tmp", MODO_JSON)
+    return jsonify(dict(modo, push=push_ligado()))
+
+
 @app.route("/status")
 def status():
     with lock:
+        frame = detect_slot["frame"]
         return jsonify(connected=state["connected"],
                        detections=state["detections"],
-                       events=list(state["events"]))
+                       # para o modo HD desenhar as caixas no instante certo
+                       det_ts=detect_slot["dets_ts"],
+                       quadro=frame.shape[1::-1] if frame is not None else None,
+                       events=list(state["events"]),
+                       push=push_ligado(), hd=bool(HLS_URL))
 
 
 @app.route("/test")
@@ -1113,15 +1351,19 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
 <title>Monitor da Câmera</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg"><style>
   body{margin:0;font:14px system-ui,sans-serif;background:#111827;color:#e5e7eb}
-  header{padding:14px 20px;background:#1f2937;display:flex;gap:12px;align-items:center}
+  header{padding:14px 20px;background:#1f2937;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
   h1{font-size:16px;margin:0}
+  #modobox{margin-left:auto;display:flex;flex-wrap:wrap;gap:6px;align-items:center;color:#9ca3af}
+  #modobox select,#modobox input{background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:5px 8px;font:inherit}
+  #push.off{color:#fbbf24}
   #st{padding:3px 10px;border-radius:99px;font-size:12px;background:#7f1d1d}
   #st.on{background:#14532d}
   #snd,#pip,#au,#aual{background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:6px 12px;cursor:pointer}
   #snd{margin-left:auto}
-  #hist{margin-left:auto;background:#374151;color:#e5e7eb;border-radius:6px;padding:6px 12px;text-decoration:none}
+  #hist{background:#374151;color:#e5e7eb;border-radius:6px;padding:6px 12px;text-decoration:none}
   .todas{display:block;margin-top:10px;color:#93c5fd;text-decoration:none}
   #snd.on,#au.on,#aual.on{background:#1d4ed8}
+  .mais{color:#93c5fd;text-decoration:none;margin-left:4px}
   main{display:grid;grid-template-columns:2fr 1fr;gap:16px;padding:16px;max-width:1300px;margin:auto}
   @media(max-width:900px){main{grid-template-columns:1fr}}
   img{width:100%;border-radius:8px;background:#000;min-height:240px}
@@ -1143,7 +1385,11 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   #st.on{background:#22c55e}
   /* setas por cima da imagem: PTZ sem gastar altura */
   .cam{position:relative;line-height:0}
-  .cam img{width:100%;border-radius:6px;display:block}
+  .cam img,.cam video{width:100%;border-radius:6px;display:block;background:#000}
+  .cam canvas{position:absolute;left:0;top:0;pointer-events:none}
+  .cam [hidden]{display:none}
+  #hd{margin-left:auto;font-size:12px;font-weight:600}
+  #hd:disabled{opacity:.4;cursor:default}
   .seta{position:absolute;top:50%;transform:translateY(-50%);border:0;cursor:pointer;
         background:rgba(17,24,39,.55);color:#e5e7eb;border-radius:8px;
         padding:16px 7px;font-size:15px;opacity:.35;transition:opacity .15s}
@@ -1164,6 +1410,11 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   body.so-pip main{grid-template-columns:1fr;padding:8px}
 </style></head><body>
 <header><h1>📷 Monitor da Câmera{{LOCAL}}</h1>
+<span id="modobox"><select id="modo" title="push no celular quando houver alerta (as fotos ficam sempre)">
+  <option value="armado">🔔 Push sempre</option><option value="em_casa">🏠 Em casa: sem push</option>
+  <option value="horario">🕘 Em casa no horário</option></select>
+  <span id="horario" hidden>das <input type="time" id="ini"> às <input type="time" id="fim"></span>
+  <span id="push" hidden></span></span>
 <a id="hist" href="/historico" target="_blank" title="todas as fotos, por dia">🗂 Histórico</a>
 <button id="pip" title="Painel flutuante por cima de tudo, com todos os controles">🗗 PiP</button></header>
 <main>
@@ -1174,8 +1425,10 @@ PAGE = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
       <button id="snd" title="bipe de alerta">🔕</button>
       <button id="au" title="áudio da câmera">🔇</button>
       <button id="aual" title="ligar o áudio sozinho por 20s quando houver detecção">🔈</button>
+      <button id="hd" hidden title="vídeo em alta (stream principal), com alguns segundos de atraso">HD</button>
     </div>
         <div class="cam"><img src="/stream" alt="stream da câmera">
+      <video id="vid" muted playsinline hidden></video><canvas id="cx" hidden></canvas>
             <button class="seta cima" data-d="cima" title="inclinar para cima">▲</button>
       <button class="seta esq" data-d="esquerda" title="girar para a esquerda">◀</button>
       <button class="seta dir" data-d="direita" title="girar para a direita">▶</button>
@@ -1223,8 +1476,13 @@ async function tick(){
     const newest = s.events[0] ? s.events[0].time + s.events[0].photo : null;
     if(lastEv !== null && newest && newest !== lastEv){ beep(); pipAlert(); audioNoAlerta(); }
     lastEv = newest || '';
+    mostraPush(s.push);
+    quadro = s.quadro;
+    if(s.det_ts && (!hdHist.length || hdHist[hdHist.length-1].ts !== s.det_ts)){
+      hdHist.push({ts:s.det_ts, dets:s.detections}); if(hdHist.length>80) hdHist.shift(); }
+    if(hdb.hidden && s.hd){ hdb.hidden=false; if(localStorage.getItem('hd')==='1' && hevcOk) hdLiga(true); }
     elLog.innerHTML = s.events.length
-      ? s.events.map(e=>`<li><time>${e.time}</time>${e.title} — ${e.msg}${e.photo?`<a href="/fotos/${e.photo}" target="_blank"><img class="thumb" src="/fotos/${e.photo}" loading="lazy"></a>`:''}</li>`).join('')
+      ? s.events.map(e=>`<li><time>${e.time}</time>${e.silencioso?'<span title="em casa: sem push">🏠</span> ':''}${e.title} — ${e.msg}${e.fotos>1?`<a class="mais" href="/historico?visita=${encodeURIComponent(e.visita)}" target="_blank">+${e.fotos-1} foto${e.fotos>2?'s':''}</a>`:''}${e.photo?`<a href="/fotos/${e.photo}" target="_blank"><img class="thumb" src="/fotos/${e.photo}" loading="lazy"></a>`:''}</li>`).join('')
       : '<li class="empty">nenhuma ainda</li>';
   }catch(e){}
 }
@@ -1327,9 +1585,11 @@ pip.onclick=async()=>{
   extra.textContent='body{margin:0;background:#111827}#painel{border-radius:0;min-height:100vh}';
   pipWin.document.head.append(extra);
   pipWin.document.body.append(painel);        // move o painel de verdade
+  if(hls) vid.play().catch(()=>{});            // o vídeo pausa ao mudar de janela
   document.getElementById('aviso').hidden=false;
   pipWin.addEventListener('pagehide',()=>{
     document.querySelector('main').prepend(painel);   // devolve para a página
+    if(hls) vid.play().catch(()=>{});
     document.getElementById('aviso').hidden=true; pipWin=null;
   });
 };
@@ -1341,6 +1601,70 @@ if(location.search.includes('pip=1')){
 function pipAlert(){ // pisca a borda do painel ~2,4s, esteja ele na página ou no PiP
   painel.style.outline='4px solid #ef4444';
   setTimeout(()=>{ painel.style.outline=''; },2400); }
+// modo em casa: as fotos continuam, o push no celular não (sempre, ou no horário)
+const selModo=document.getElementById('modo'), elHor=document.getElementById('horario'),
+      ini=document.getElementById('ini'), fim=document.getElementById('fim'), elPush=document.getElementById('push');
+function mostraPush(p){ elPush.hidden=selModo.value!=='horario';
+  elPush.textContent=p?'agora: push ligado':'agora: sem push'; elPush.className=p?'':'off'; }
+function mostraModo(m){ selModo.value=m.modo; ini.value=m.inicio; fim.value=m.fim;
+  elHor.hidden=m.modo!=='horario'; mostraPush(m.push); }
+async function salvaModo(){
+  try{ const r=await fetch('/modo',{method:'POST',headers:{'Content-Type':'application/json'},
+         body:JSON.stringify({modo:selModo.value,inicio:ini.value,fim:fim.value})});
+    if(r.ok) mostraModo(await r.json()); else alert(await r.text()); }catch(e){}
+}
+selModo.onchange=salvaModo; ini.onchange=fim.onchange=()=>{ if(ini.value&&fim.value) salvaModo(); };
+fetch('/modo').then(r=>r.json()).then(mostraModo).catch(()=>{});
+// HD: HLS do stream principal, que o MediaMTX só copia (o aparelho não
+// decodifica nada). Enquanto isso o MJPEG fecha e o aparelho para de gerar JPEG.
+// O HLS chega alguns segundos atrasado: as caixas vão num canvas, com a análise
+// do instante que está na tela (det_ts do /status x playingDate do hls.js,
+// que vem do PROGRAM-DATE-TIME; os dois são o relógio do aparelho).
+const img=painel.querySelector('.cam img'), vid=painel.querySelector('#vid'),
+      cx=painel.querySelector('#cx'), hdb=painel.querySelector('#hd');
+const HLSJS='https://cdn.jsdelivr.net/npm/hls.js@1.7.3/dist/hls.min.js',
+      HLSJS_SRI='sha384-cciJ0zi8d1uMKC2zJd7jvPY4HQt7W4ByUI/FlMkltvBi31aW61rcpVBhpmW8/NwX';
+const COR={pessoa:'#ffb450',animal:'#78ff78',veiculo:'#50beff'};
+const MSE=window.ManagedMediaSource||window.MediaSource;
+const hevcOk=!!MSE && ['hvc1.1.6.L93.B0','hev1.1.6.L93.B0'].some(c=>MSE.isTypeSupported(`video/mp4; codecs="${c}"`));
+let hls=null, hdHist=[], quadro=null;
+if(!hevcOk){ hdb.disabled=true; hdb.title='este navegador não toca H.265 (tente Chrome, Edge ou Safari)'; }
+function carregaHlsJs(){
+  return window.Hls ? Promise.resolve() : new Promise((ok,erro)=>{
+    const sc=document.createElement('script'); sc.src=HLSJS; sc.integrity=HLSJS_SRI;
+    sc.crossOrigin='anonymous'; sc.onload=ok; sc.onerror=erro; document.head.append(sc); });
+}
+async function hdLiga(on, avisar){
+  if(hls){ hls.destroy(); hls=null; }
+  hdb.className=on?'on':''; localStorage.setItem('hd',on?'1':'0');
+  if(!on){ vid.hidden=cx.hidden=true; img.hidden=false; img.src='/stream'; return; }
+  const falhou=msg=>{ hdLiga(false); if(avisar) alert(msg); else hdb.title=msg; };
+  try{ await carregaHlsJs(); }catch(e){ return falhou('não deu para carregar o hls.js'); }
+  if(!Hls.isSupported()) return falhou('este navegador não toca HLS');
+  img.src='data:,'; img.hidden=true; vid.hidden=cx.hidden=false;
+  hls=new Hls({liveSyncDurationCount:2, manifestLoadingMaxRetry:8, levelLoadingMaxRetry:8});
+  hls.on(Hls.Events.ERROR,(ev,d)=>{ if(d.fatal) falhou(d.details==='manifestIncompatibleCodecsError'
+    ? 'este navegador não toca H.265' : 'o HD caiu ('+d.details+')'); });
+  hls.loadSource('/hd/index.m3u8'); hls.attachMedia(vid); vid.play().catch(()=>{});
+  const h=hls; requestAnimationFrame(function desenha(){ if(hls!==h) return; caixasHd(); requestAnimationFrame(desenha); });
+}
+function caixasHd(){
+  const w=vid.clientWidth, h=vid.clientHeight;
+  if(cx.width!==w || cx.height!==h){ cx.width=w; cx.height=h; }
+  const g=cx.getContext('2d'); g.clearRect(0,0,w,h);
+  const quando=hls.playingDate; if(!quando || !quadro) return;
+  const t=quando.getTime()/1000;
+  let a=null; for(const x of hdHist){ if(x.ts<=t) a=x; else break; }   // última análise até o quadro na tela
+  if(!a) return;
+  const sx=w/quadro[0], sy=h/quadro[1];
+  g.lineWidth=2; g.font='600 13px system-ui,sans-serif';
+  for(const d of a.dets){
+    const [x1,y1,x2,y2]=d.box; g.strokeStyle=g.fillStyle=COR[d.category]||'#fff';
+    g.strokeRect(x1*sx,y1*sy,(x2-x1)*sx,(y2-y1)*sy);
+    g.fillText(`${d.label} ${Math.round(d.confidence*100)}%`, x1*sx+2, Math.max(14,y1*sy-5));
+  }
+}
+hdb.onclick=()=>hdLiga(!hls, true);
 setInterval(tick, 1500); tick();
 </script></body></html>"""
 PAGE = PAGE.replace("{{LOCAL}}", f' <span style="color:#9ca3af;font-weight:400">· '
@@ -1362,19 +1686,24 @@ HISTORICO = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   h2{font-size:13px;margin:22px 0 10px;text-transform:uppercase;letter-spacing:.05em;color:#9ca3af}
   h2:first-child{margin-top:0}
   .grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(220px,40vw),1fr));gap:10px}
-  figure{margin:0;background:#1f2937;border-radius:8px;overflow:hidden;cursor:zoom-in}
+  figure{margin:0;background:#1f2937;border-radius:8px;overflow:hidden;cursor:zoom-in;position:relative}
   figure img{display:block;width:100%;aspect-ratio:16/9;object-fit:cover;background:#000}
-  figcaption{padding:6px 8px;display:flex;justify-content:space-between;color:#9ca3af}
+  figcaption{padding:6px 8px;display:flex;gap:6px;justify-content:space-between;align-items:center;color:#9ca3af}
   .tag{padding:1px 8px;border-radius:99px;font-size:12px;color:#e5e7eb}
   .pessoa{background:#7c2d12}.animal{background:#14532d}.veiculo{background:#1e3a8a}
+  .n{position:absolute;top:6px;right:6px;background:rgba(17,24,39,.8);border-radius:99px;padding:1px 8px;font-size:12px}
+  .rot{font-size:12px}.rot.falso{color:#f87171}.rot.real{color:#4ade80}
+  figure.falso img{opacity:.45}
   #vazio{color:#6b7280;text-align:center;padding:40px}
   #mais{display:block;margin:20px auto;background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:8px 16px;cursor:pointer}
   #zoom{position:fixed;inset:0;background:rgba(0,0,0,.92);display:flex;flex-direction:column;
         align-items:center;justify-content:center;gap:8px;z-index:2}
   #zoom[hidden]{display:none}
-  #zoom img{max-width:96vw;max-height:84vh;border-radius:6px}
-  #zoom .nav{display:flex;gap:10px;align-items:center}
+  #zoom img{max-width:96vw;max-height:78vh;border-radius:6px}
+  #zoom .nav{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;align-items:center;padding:0 8px}
   #zoom button{background:#374151;color:#e5e7eb;border:0;border-radius:6px;padding:8px 14px;font-size:16px;cursor:pointer}
+  #zoom .rotular button{font-size:14px}
+  #zoom #real.on{background:#15803d} #zoom #falso.on{background:#b91c1c}
 </style></head><body>
 <header><h1>🗂 Histórico</h1>
   <select id="dia" title="dia"></select>
@@ -1383,43 +1712,60 @@ HISTORICO = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
   <a href="/">← ao vivo</a></header>
 <main id="lista"></main>
 <div id="zoom" hidden><img alt="foto do alerta"><div class="nav">
-  <button id="ant" title="mais nova (←)">◀</button><span id="leg"></span>
-  <button id="prox" title="mais antiga (→)">▶</button>
-  <a id="abrir" target="_blank">abrir</a><button id="fechar" title="fechar (Esc)">✕</button></div></div>
+  <button id="ant" title="foto anterior (←)">◀</button><span id="leg"></span>
+  <button id="prox" title="próxima foto (→)">▶</button>
+  <a id="abrir" target="_blank">abrir</a><button id="fechar" title="fechar (Esc)">✕</button></div>
+  <div class="nav rotular">esta visita foi
+  <button id="real" title="alerta certo (C)">✓ alerta certo</button>
+  <button id="falso" title="falso alarme (F)">✗ falso alarme</button></div></div>
 <script>
+// Um card por visita (as fotos seguidas da mesma pessoa/bicho/carro). O zoom
+// anda foto a foto: dentro da visita em ordem de hora, e depois para a visita
+// anterior. O rótulo (certo/falso) vale para todas as fotos da visita.
 const NOMES={pessoa:'Pessoa',animal:'Animal',veiculo:'Carro'}, LOTE=120;
-let todas=[], vistas=[], mostrando=0, cat='', aberta=-1;
+const ROT={real:'✓ certo',falso:'✗ falso'};
+let todas=[], vistas=[], cards=[], mostrando=0, cat='', aberta=-1;
 const $=id=>document.getElementById(id), lista=$('lista'), selDia=$('dia');
 const fmtDia=d=>new Date(d+'T12:00').toLocaleDateString('pt-BR',{weekday:'long',day:'2-digit',month:'2-digit',year:'numeric'});
+const daVisita=v=>todas.filter(f=>f.visita===v);
 async function carregar(){
   todas=await (await fetch('/historico.json')).json();
   const dias={}; todas.forEach(f=>dias[f.dia]=(dias[f.dia]||0)+1);
-  selDia.innerHTML=`<option value="">Todos os dias (${todas.length})</option>`+
-    Object.keys(dias).map(d=>`<option value="${d}">${fmtDia(d)} (${dias[d]})</option>`).join('');
+  selDia.innerHTML=`<option value="">Todos os dias (${todas.length} fotos)</option>`+
+    Object.keys(dias).sort().reverse().map(d=>`<option value="${d}">${fmtDia(d)} (${dias[d]})</option>`).join('');
   filtrar();
+  const v=new URLSearchParams(location.search).get('visita');   // link "+N fotos" do painel
+  if(v){ const i=vistas.findIndex(f=>f.visita===v); if(i>=0) abrir(i); }
 }
 function filtrar(){
   vistas=todas.filter(f=>(!selDia.value||f.dia===selDia.value)&&(!cat||f.cat===cat));
+  cards=vistas.map((f,i)=>i).filter(i=>i===0||vistas[i-1].visita!==vistas[i].visita);
   mostrando=0; lista.innerHTML=''; mais();
+}
+function card(k){
+  const i=cards[k], n=(cards[k+1]??vistas.length)-i, f=vistas[i], ult=vistas[i+n-1], r=f.rotulo;
+  const hora=n>1&&ult.hora.slice(0,5)!==f.hora.slice(0,5)?`${f.hora.slice(0,5)}–${ult.hora.slice(0,5)}`:f.hora;
+  return `<figure data-i="${i}" data-v="${f.visita}" class="${r||''}"><img src="/fotos/${f.photo}" loading="lazy" alt="">
+    ${n>1?`<span class="n">${n} fotos</span>`:''}
+    <figcaption><span>${hora}</span><span class="rot ${r||''}">${r?ROT[r]:''}</span><span class="tag ${f.cat}">${NOMES[f.cat]}</span></figcaption></figure>`;
 }
 function mais(){   // em lotes: com milhares de fotos, a página não monta tudo de uma vez
   $('mais')?.remove();
-  if(!vistas.length){ lista.innerHTML='<p id="vazio">nenhuma foto</p>'; return; }
-  const fim=Math.min(vistas.length,mostrando+LOTE);
-  for(let i=mostrando;i<fim;i++){
-    const f=vistas[i];
+  if(!cards.length){ lista.innerHTML='<p id="vazio">nenhuma foto</p>'; return; }
+  const fim=Math.min(cards.length,mostrando+LOTE);
+  for(let k=mostrando;k<fim;k++){
+    const dia=vistas[cards[k]].dia;
     let g=lista.lastElementChild;
-    if(!g||g.dataset.dia!==f.dia){
-      const n=vistas.filter(v=>v.dia===f.dia).length;
-      lista.insertAdjacentHTML('beforeend',`<h2>${fmtDia(f.dia)} · ${n} foto${n>1?'s':''}</h2><div class="grade" data-dia="${f.dia}"></div>`);
+    if(!g||g.dataset.dia!==dia){
+      const nv=cards.filter(i=>vistas[i].dia===dia).length, nf=vistas.filter(f=>f.dia===dia).length;
+      lista.insertAdjacentHTML('beforeend',`<h2>${fmtDia(dia)} · ${nv} alerta${nv>1?'s':''}${nf>nv?` · ${nf} fotos`:''}</h2><div class="grade" data-dia="${dia}"></div>`);
       g=lista.lastElementChild;
     }
-    g.insertAdjacentHTML('beforeend',`<figure data-i="${i}"><img src="/fotos/${f.photo}" loading="lazy" alt="">
-      <figcaption><span>${f.hora}</span><span class="tag ${f.cat}">${NOMES[f.cat]}</span></figcaption></figure>`);
+    g.insertAdjacentHTML('beforeend',card(k));
   }
   mostrando=fim;
-  if(mostrando<vistas.length)
-    lista.insertAdjacentHTML('beforeend',`<button id="mais">mostrar mais (${vistas.length-mostrando} restantes)</button>`);
+  if(mostrando<cards.length)
+    lista.insertAdjacentHTML('beforeend',`<button id="mais">mostrar mais (${cards.length-mostrando} alertas restantes)</button>`);
 }
 lista.onclick=e=>{
   if(e.target.id==='mais') return mais();
@@ -1427,16 +1773,32 @@ lista.onclick=e=>{
 };
 function abrir(i){
   if(i<0||i>=vistas.length) return;
-  aberta=i; const f=vistas[i], z=$('zoom');
+  aberta=i; const f=vistas[i], z=$('zoom'), vs=vistas.filter(x=>x.visita===f.visita);
   z.querySelector('img').src='/fotos/'+f.photo; $('abrir').href='/fotos/'+f.photo;
-  $('leg').textContent=`${fmtDia(f.dia)} ${f.hora} · ${NOMES[f.cat]} · ${i+1}/${vistas.length}`;
+  $('leg').textContent=`${fmtDia(f.dia)} ${f.hora} · ${NOMES[f.cat]}`+
+    (vs.length>1?` · foto ${vs.indexOf(f)+1} de ${vs.length} da visita`:'');
+  $('real').classList.toggle('on',f.rotulo==='real'); $('falso').classList.toggle('on',f.rotulo==='falso');
   z.hidden=false;
+}
+async function rotular(r){
+  if(aberta<0) return;
+  const v=vistas[aberta].visita, fotos=daVisita(v);
+  if(fotos[0].rotulo===r) r=null;            // clicar no marcado desmarca
+  const resp=await fetch('/rotulos',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({fotos:fotos.map(f=>f.photo),rotulo:r})});
+  if(!resp.ok){ alert(await resp.text()); return; }
+  fotos.forEach(f=>f.rotulo=r);
+  const fig=lista.querySelector(`figure[data-v="${CSS.escape(v)}"]`);
+  if(fig){ fig.className=r||''; const s=fig.querySelector('.rot'); s.className='rot '+(r||''); s.textContent=r?ROT[r]:''; }
+  abrir(aberta);
 }
 const fechar=()=>{ $('zoom').hidden=true; aberta=-1; };
 $('ant').onclick=()=>abrir(aberta-1); $('prox').onclick=()=>abrir(aberta+1); $('fechar').onclick=fechar;
+$('real').onclick=()=>rotular('real'); $('falso').onclick=()=>rotular('falso');
 $('zoom').onclick=e=>{ if(e.target.id==='zoom') fechar(); };
 document.onkeydown=e=>{ if(aberta<0) return;
-  if(e.key==='Escape') fechar(); else if(e.key==='ArrowLeft') abrir(aberta-1); else if(e.key==='ArrowRight') abrir(aberta+1); };
+  if(e.key==='Escape') fechar(); else if(e.key==='ArrowLeft') abrir(aberta-1); else if(e.key==='ArrowRight') abrir(aberta+1);
+  else if(e.key==='c') rotular('real'); else if(e.key==='f') rotular('falso'); };
 selDia.onchange=filtrar;
 document.querySelectorAll('.cat').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.cat').forEach(x=>x.classList.toggle('on',x===b)); cat=b.dataset.c; filtrar(); });
@@ -1525,6 +1887,63 @@ def _selfcheck():
     assert checar_saude(5201)[-1][0] == "Vídeo instável"
     assert checar_saude(5300) == []                                  # no máx. 1/hora
     assert ALAW[0x55] == -8 and ALAW[0xD5] == 8 and ALAW[0x2A] == -32256 and ALAW[0xAA] == 32256
+    assert descartar("pessoa", 0.2, [0, 200, 50, 350], 640, 360, 360) == "abaixo do limiar"
+    assert descartar("pessoa", 0.4, [0, 200, 50, 350], 640, 360, 360) is None
+    # visitas: um push por visita, mais fotos sem push, visita nova depois de sumir
+    streaks.clear()
+    visitas.clear()
+    p = [{"category": "pessoa", "label": "Pessoa"}]
+    ev = maybe_notify(p, now=1000)
+    assert len(ev) == 1 and ev[0]["nova"] and ev[0]["visita"].endswith("_pessoa")
+    assert maybe_notify(p, now=1010) == []                           # foto recente
+    ev2 = maybe_notify(p, now=1021)
+    assert ev2 and not ev2[0]["nova"] and ev2[0]["visita"] == ev[0]["visita"]
+    assert maybe_notify([], now=1050) == []
+    assert maybe_notify(p, now=1100)[0]["nova"] is False             # sumiu 79 s: a mesma
+    assert maybe_notify(p, now=1100 + VISITA_FIM_S + 1)[0]["nova"]   # sumiu mais: nova
+    a = [{"category": "animal", "label": "Gato"}]
+    assert maybe_notify(a, now=5000) == [] and maybe_notify(a, now=5001) == []
+    assert maybe_notify(a, now=5002)[0]["nova"]                      # 3 seguidas
+    streaks.clear()
+    visitas.clear()
+    # em casa: no horário, sem push (o horário pode virar a meia-noite)
+    salvo = dict(modo)
+    hm = lambda s: time.mktime(time.strptime("2026-11-09 " + s, "%Y-%m-%d %H:%M"))
+    modo.update(modo="horario", inicio="22:00", fim="07:00")
+    assert not push_ligado(hm("23:30")) and not push_ligado(hm("06:59"))
+    assert push_ligado(hm("07:00")) and push_ligado(hm("12:00"))
+    modo.update(inicio="08:00", fim="18:00")
+    assert not push_ligado(hm("08:00")) and push_ligado(hm("18:00")) and push_ligado(hm("03:00"))
+    modo.update(modo="em_casa")
+    assert not push_ligado(hm("03:00"))
+    modo.update(modo="armado")
+    assert push_ligado(hm("23:30"))
+    modo.update(salvo)
+    assert modo_valido({"modo": "horario", "inicio": "25:00"}) is None
+    assert modo_valido({"modo": "x"}) is None and modo_valido(None) is None
+    assert modo_valido({"modo": "em_casa"})["fim"] == modo["fim"]
+    # heartbeat: a cada HEARTBEAT_S, e nada sem vídeo
+    global HEARTBEAT_URL
+    url_antes, HEARTBEAT_URL = HEARTBEAT_URL, "http://exemplo.invalid/ping"
+    saude.update(sem_video=False, ultimo_ping=0.0)
+    assert heartbeat_devido(10000) and not heartbeat_devido(10100)
+    assert heartbeat_devido(10000 + HEARTBEAT_S)
+    saude["sem_video"] = True
+    assert not heartbeat_devido(20000)
+    saude.update(sem_video=False, ultimo_ping=0.0)
+    HEARTBEAT_URL = url_antes
+    # CSRF: o que muda algo só vale pedido da própria página (ou de curl)
+    for metodo, cab, caminho, recusa in (
+            ("POST", {"Sec-Fetch-Site": "cross-site"}, "/ptz/esquerda", True),
+            ("POST", {"Sec-Fetch-Site": "same-site"}, "/ptz/esquerda", True),
+            ("POST", {"Sec-Fetch-Site": "same-origin"}, "/ptz/esquerda", False),
+            ("DELETE", {}, "/posicoes/portao", False),                   # curl
+            ("POST", {"Origin": "https://mal.example"}, "/modo", True),  # sem Sec-Fetch-*
+            ("POST", {"Origin": "http://localhost"}, "/modo", False),
+            ("GET", {"Sec-Fetch-Site": "cross-site"}, "/test", True),
+            ("GET", {"Sec-Fetch-Site": "cross-site"}, "/fotos/a.jpg", False)):
+        with app.test_request_context(caminho, method=metodo, headers=cab):
+            assert outro_site() is recusa, (metodo, cab, caminho)
 
 
 def start_capture_worker():
