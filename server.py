@@ -236,7 +236,7 @@ def load_events():
     if eventos is None:
         return
     for ev in eventos:
-        ev_painel = {k: v for k, v in ev.items() if k not in ("dets", "quadro")}
+        ev_painel = {k: v for k, v in ev.items() if k not in ("dets", "quadro", "modelo")}
         # linhas de antes das visitas (2026-11-09): cada foto é uma visita
         ev_painel.setdefault("visita", (ev.get("photo") or "")[:-4] or ev.get("time"))
         painel_adiciona(ev_painel)
@@ -816,8 +816,8 @@ def save_events(fired, frame, ts, dets):
             else:
                 ev["silencioso"] = True       # em casa: foto sem push
     with open(EVENTS_FILE, "a", encoding="utf-8") as f:
-        f.writelines(json.dumps(dict(ev, dets=dets, quadro=[W, H]), ensure_ascii=False)
-                     + "\n" for ev in fired)
+        f.writelines(json.dumps(dict(ev, dets=dets, quadro=[W, H], modelo=DETECT_MODEL),
+                                ensure_ascii=False) + "\n" for ev in fired)
     with lock:
         for ev in fired:
             painel_adiciona(ev)

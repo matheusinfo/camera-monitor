@@ -5,8 +5,10 @@ No /historico cada visita pode ser marcada como alerta certo ou falso alarme
 
   1. filtros (sempre): reaplica os filtros de hoje (server.descartar) nas
      caixas que o detector gravou no eventos.jsonl na hora do alerta. Não
-     depende do modelo nem da recompressão do JPEG: o resultado é sempre o
-     mesmo. Use ao mexer em PESSOA_MIN, PESSOA_BASE_MIN e afins.
+     depende da recompressão do JPEG: o resultado é sempre o mesmo. Use ao
+     mexer em PESSOA_MIN, PESSOA_BASE_MIN e afins. Só entram as caixas do
+     modelo de hoje (DETECT_MODEL): a confiança de um não vale no limiar do
+     outro. Linhas sem "modelo" são do MobileNet (antes de 2026-11-09).
   2. modelo (--modelo): roda o detector de hoje de novo nas fotos. A foto é
      JPEG recomprimido e não reproduz o ao vivo à risca; serve para comparar
      modelos e limiares.
@@ -67,11 +69,14 @@ def main():
                for ev in server.ler_eventos(os.path.join(args.pasta, "eventos.jsonl")) or []
                if ev.get("photo")}
 
-    filtros, sem_caixas = {}, 0
+    filtros, sem_caixas, outro_modelo = {}, 0, 0
     for foto, rotulo in sorted(rotulos.items()):
         ev = eventos.get(foto)
         if not ev or "dets" not in ev:
             sem_caixas += 1     # alerta de antes de 2026-11-06: só a foto
+            continue
+        if ev.get("modelo", "mobilenet") != server.DETECT_MODEL:
+            outro_modelo += 1
             continue
         W, H = ev.get("quadro") or (cv2.imread(os.path.join(args.pasta, foto)).shape[1::-1])
         cat = categoria(foto)
@@ -82,6 +87,8 @@ def main():
     perdidos = resumo("filtros (caixas gravadas)", filtros)
     if sem_caixas:
         print(f"  {sem_caixas} rotulados sem caixas gravadas (de antes de 06/11): só no --modelo")
+    if outro_modelo:
+        print(f"  {outro_modelo} rotulados com caixas de outro modelo: só no --modelo")
 
     if args.modelo:
         modelo = {}
