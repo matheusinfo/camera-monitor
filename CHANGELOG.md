@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Detector trocado para o YOLOX-Tiny (Megvii, Apache-2.0, entrada 320x192), no lugar do MobileNet-SSD. Nas 300 fotos de alerta da Echo, rotuladas uma a uma: ve 273 das 284 pessoas reais (MobileNet 251) e nao gera pessoa na chuva, em quadro corrompido, nem os "onibus" falsos no portao. Custo na Echo ~1,1x (0,80 s contra 0,73 s por analise). `PESSOA_MIN` passa a 0,35 e o filtro de chuva a 0,5 no YOLOX. `DETECT_MODEL=mobilenet` volta ao antigo, que segue no Pi 3 (YOLOX nao medido la). Caminhao (picape, van) conta como veiculo.
 - Um push por visita, nao um a cada 20 s: o 1o alerta abre a visita; enquanto a pessoa (ou bicho) continua aparecendo, sem sumir por mais de `VISITA_FIM_S` (90 s), entra mais uma foto a cada 20 s, sem push. Na Echo uma pessoa 12 min no portao mandou 35 pushes. O painel mostra a visita uma vez, com "+N fotos"; o historico mostra um card por visita (as fotos de antes juntam pela hora, com a mesma regra).
 - Marcacao de alerta certo / falso alarme no historico (zoom, teclas `c` e `f`), em `fotos/rotulos.json`. O `test_detect.py` foi refeito em cima dela: reaplica os filtros de hoje nas caixas gravadas no `eventos.jsonl` (resultado estavel) e, com `--modelo`, roda o detector de novo nas fotos. Falha se algum alerta certo deixar de alertar. O `eventos.jsonl` passa a gravar a visita e o tamanho do quadro.
 - CI roda o `_selfcheck` do `server.py` (antes so `py_compile`).

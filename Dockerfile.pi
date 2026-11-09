@@ -17,7 +17,7 @@ RUN curl -fsSL "https://github.com/bluenviron/mediamtx/releases/download/${MEDIA
     | tar -xz -C /usr/local/bin mediamtx
 
 WORKDIR /app
-COPY server.py config.py ptz.py gunicorn.conf.py MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel ./
+COPY server.py config.py ptz.py gunicorn.conf.py yolox_tiny.onnx MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel ./
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 

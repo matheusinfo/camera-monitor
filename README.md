@@ -22,8 +22,8 @@ O Camera Monitor transforma o stream RTSP da camera em um painel web pratico par
 
 - Recebe video H.265 e audio G.711 da camera via RTSP.
 - Usa MediaMTX como relay para lidar com a negociacao RTSP da camera.
-- Converte o video para MJPEG e analisa os frames com MobileNet-SSD.
-- Detecta pessoas e animais com limiar de confianca configuravel no codigo.
+- Converte o video para MJPEG e analisa os frames com YOLOX-Tiny (ou o MobileNet-SSD antigo, no Pi).
+- Detecta pessoas, animais e carro parado, com limiares configuraveis.
 - Desenha as deteccoes no video ao vivo e registra a foto de cada alerta, limpa (sem caixa por cima).
 - Junta as fotos seguidas da mesma pessoa (ou bicho) numa visita: um push quando ela chega, e mais uma foto a cada 20 s enquanto fica, sem push.
 - Mostra as 10 visitas mais recentes no painel e todas as fotos na pagina de historico, por visita e por dia, com filtro por dia e por tipo. Cada visita pode ser marcada como alerta certo ou falso alarme, e o `test_detect.py` confere a deteccao contra essas marcacoes.
@@ -45,7 +45,7 @@ O Camera Monitor transforma o stream RTSP da camera em um painel web pratico par
 flowchart LR
     C[Camera RTSP\nH.265 + G.711] --> M[MediaMTX\nrelay UDP]
     M --> F[FFmpeg\nMJPEG + PCM]
-    F --> P[Python Flask\nOpenCV + MobileNet-SSD]
+    F --> P[Python Flask\nOpenCV + YOLOX-Tiny]
     P --> B[Navegador\nvideo, audio, alertas e PTZ]
     P --> T[Cloudflare Tunnel\nacesso remoto HTTPS]
     P --> O[ONVIF\nmovimento PTZ]
@@ -101,7 +101,8 @@ Variaveis opcionais:
 | `HEARTBEAT_URL` | vazio | URL que recebe um GET a cada 5 min enquanto o video chega (ex.: check do healthchecks.io). Vazio desliga |
 | `MOTION_BLOB` | `40` | Maior mancha de movimento (px, miniatura 160x90) para rodar o MobileNet; ignora chuva; `0` analisa sempre |
 | `DETECT_TILES` | `0` | `1` tambem analisa recortes do quadro: acha pessoa pequena ou atras de grade, com ~13x mais CPU. Mantenha `0` no Pi |
-| `PESSOA_MIN` | `0.25` | Confianca minima para alerta de pessoa |
+| `DETECT_MODEL` | `yolox` | Detector: `yolox` (YOLOX-Tiny, COCO) ou `mobilenet` (MobileNet-SSD, VOC; o do Pi 3) |
+| `PESSOA_MIN` | `0.35` (`0.25` no MobileNet) | Confianca minima para alerta de pessoa |
 | `PESSOA_BASE_MIN` | `0.7` | Pessoa cuja caixa termina acima dessa fracao da altura do quadro esta longe (moto e carro na rua, vistos pela grade) e nao avisa. `0` desliga |
 | `CARRO_PARADO_S` | vazio | Segundos com um carro parado no mesmo lugar, em qualquer ponto da imagem, ate avisar (ex.: `20`). Carro que so passa nao avisa. Vazio ou `0` desliga |
 | `CARRO_MIN` | `0.5` | Confianca minima para contar um veiculo |
@@ -195,7 +196,7 @@ Copiar so o necessario e subir (a partir da raiz do projeto):
 
 ```bash
 tar -czf - Dockerfile.pi compose.pi.yaml server.py config.py ptz.py gunicorn.conf.py \
-    docker-entrypoint.sh MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel \
+    docker-entrypoint.sh yolox_tiny.onnx MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel \
   | ssh pi@ssh-pi 'mkdir -p ~/camera-monitor/fotos && tar -C ~/camera-monitor -xzf -'
 ssh pi@ssh-pi 'cd ~/camera-monitor && docker compose -f compose.pi.yaml up -d --build'
 ```
@@ -524,7 +525,8 @@ No Raspberry Pi:
     a olhar a rua de cima, reveja o valor.
   - *Chuva na lente:* de noite, no IR, os pingos viram uma caixa do topo ao pe
     do quadro, com confianca de 0,25-0,53. Caixa que encosta nas duas bordas
-    so avisa a partir de 0,6; pessoa colada na camera passa de 0,8.
+    so avisa a partir de 0,6 (0,5 no YOLOX, que nao gerou pessoa na chuva nas
+    fotos medidas); pessoa colada na camera passa de 0,8.
 
   Marque os falsos alarmes no historico: o `test_detect.py` mostra quantos os
   filtros de hoje barram, e se algum ajuste passou a perder alerta certo.
@@ -588,7 +590,8 @@ docker-entrypoint.sh      Inicializa MediaMTX e o servidor Python
 start-mediamtx-windows.ps1  Relay MediaMTX no host Windows, so para WSL2
 .env.exemplo              Modelo de configuracao local
 fotos/                    Fotos dos alertas, eventos.jsonl, rotulos.json, .modo.json e .presets/ (privado)
-MobileNetSSD_deploy.*     Modelo MobileNet-SSD e configuracao Caffe
+yolox_tiny.onnx           Detector YOLOX-Tiny (Megvii, Apache-2.0, ver LICENSE-YOLOX)
+MobileNetSSD_deploy.*     Modelo MobileNet-SSD e configuracao Caffe (DETECT_MODEL=mobilenet)
 ```
 
 ## Seguranca

@@ -19,7 +19,7 @@ DIR=/data/camera-monitor
 COMPOSE="docker compose -f compose.echo.yaml --profile tunnel"
 # O que o Dockerfile.echo copia, mais o que monta a imagem e o tunnel.
 ARQUIVOS="server.py config.py ptz.py gunicorn.conf.py docker-entrypoint.sh
-  MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel
+  yolox_tiny.onnx MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel
   Dockerfile.echo Dockerfile.cloudflared compose.echo.yaml echo-deps.sh
   seccomp-echo.json requirements-docker.txt"
 BASE="requirements-docker.txt echo-deps.sh"

@@ -90,10 +90,20 @@ MOTION_IDLE_S = 10
 DETECT_TILES = os.environ.get("DETECT_TILES", "0") == "1"
 # Onde o monitor roda, no título do painel (ex.: "Echo Show"). Vazio não mostra.
 PAINEL_LOCAL = os.environ.get("PAINEL_LOCAL", "")
-# Pessoa atrás da grade do portão sai com 0,25-0,45 (barras cortam o corpo);
-# portão vazio não dá nada nem no piso do modelo, 0,25 (medido de dia no Pi,
-# 2026-10). Falso alarme à noite? Suba PESSOA_MIN. Animal fica alto: alucinação.
-CONFIDENCE_MIN = {"pessoa": float(os.environ.get("PESSOA_MIN") or "0.25"),
+# Detector: "yolox" (YOLOX-Tiny, COCO, padrão) ou "mobilenet" (MobileNet-SSD,
+# VOC, o antigo). Nas 300 fotos de alerta da Echo (2026-11-09, rotuladas uma a
+# uma): YOLOX vê 273 das 284 pessoas reais, MobileNet 251; YOLOX não gera
+# pessoa na chuva nem em quadro corrompido, nem os "ônibus" falsos no portão.
+# Custo na Echo (1 thread): 0,80 s contra 0,73 s. O Pi 3 fica no MobileNet
+# (compose.pi.yaml): o YOLOX não foi medido lá.
+DETECT_MODEL = os.environ.get("DETECT_MODEL", "yolox").lower()
+YOLOX = DETECT_MODEL != "mobilenet"
+# Pessoa atrás da grade do portão sai com 0,25-0,45 no MobileNet (barras cortam
+# o corpo); portão vazio não dá nada nem no piso do modelo, 0,25 (medido de dia
+# no Pi, 2026-10). No YOLOX a curva é plana (0,25: 273 reais; 0,35: 268): 0,35
+# deixa folga para falso ao vivo. Falso alarme à noite? Suba PESSOA_MIN. Animal
+# fica alto: alucinação.
+CONFIDENCE_MIN = {"pessoa": float(os.environ.get("PESSOA_MIN") or ("0.35" if YOLOX else "0.25")),
                   "animal": 0.65,
                   # o portão fechado já saiu "carro 0,29" de dia: o log mostra
                   # cada veículo visto, com a confiança
@@ -104,10 +114,11 @@ CONFIDENCE_MIN = {"pessoa": float(os.environ.get("PESSOA_MIN") or "0.25"),
 # 86-100%). Depende do enquadramento: se o PTZ passar a olhar a rua de cima,
 # reveja. 0 desliga.
 PESSOA_BASE_MIN = float(os.environ.get("PESSOA_BASE_MIN") or "0.7")
-# Chuva na lente vira caixa de pessoa do topo ao pé do quadro (0,25-0,53, à
-# noite no IR e de dia). Pessoa de verdade, até de corpo inteiro no portão, não
-# encosta nas duas bordas; colada na câmera, sai acima de 0,8.
-PESSOA_ALTA_MIN = 0.6
+# Chuva na lente vira caixa de pessoa do topo ao pé do quadro (MobileNet:
+# 0,25-0,53, à noite no IR e de dia). Pessoa de verdade, até de corpo inteiro
+# no portão, não encosta nas duas bordas; colada na câmera, sai acima de 0,8.
+# O YOLOX não gerou pessoa na chuva, e pessoa real do topo ao pé sai 0,78-0,91.
+PESSOA_ALTA_MIN = 0.5 if YOLOX else 0.6
 # Visita: o 1º alerta de uma categoria abre a visita e manda o push; enquanto
 # ela continuar aparecendo, sem sumir por mais de VISITA_FIM_S, entra mais uma
 # foto a cada FOTO_VISITA_S, sem push. Antes era um push a cada 20 s: na Echo
@@ -149,19 +160,34 @@ VOC_CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle",
                "bus", "car", "cat", "chair", "cow", "diningtable", "dog",
                "horse", "motorbike", "person", "pottedplant", "sheep", "sofa",
                "train", "tvmonitor"]
+# COCO (YOLOX) usa motorcycle e tem truck (picape e van saem assim); VOC
+# (MobileNet) usa motorbike. Elefante, urso, zebra e girafa ficam de fora.
+COCO_CLASSES = (
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+    "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+    "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+    "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+    "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+    "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+    "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+    "toothbrush")
 LABELS_PT = {"person": "Pessoa", "bird": "Pássaro", "cat": "Gato",
              "cow": "Vaca", "dog": "Cachorro", "horse": "Cavalo",
              "sheep": "Ovelha", "car": "Carro", "bus": "Ônibus",
-             "motorbike": "Moto"}
+             "motorbike": "Moto", "motorcycle": "Moto", "truck": "Caminhão"}
 CATEGORY = {"person": "pessoa"} | {k: "animal" for k in
             ("bird", "cat", "cow", "dog", "horse", "sheep")}
 if CARRO_PARADO_S > 0:
-    CATEGORY |= {k: "veiculo" for k in ("car", "bus", "motorbike")}
+    CATEGORY |= {k: "veiculo" for k in ("car", "bus", "motorbike", "motorcycle", "truck")}
 BOX_COLOR = {"pessoa": (80, 180, 255), "animal": (120, 255, 120),
              "veiculo": (255, 190, 80)}  # BGR
 
-net = cv2.dnn.readNetFromCaffe("MobileNetSSD_deploy.prototxt",
-                               "MobileNetSSD_deploy.caffemodel")
+net = (cv2.dnn.readNet("yolox_tiny.onnx") if YOLOX else
+       cv2.dnn.readNetFromCaffe("MobileNetSSD_deploy.prototxt",
+                                "MobileNetSSD_deploy.caffemodel"))
 if DETECT_THREADS:
     cv2.setNumThreads(DETECT_THREADS)
 
@@ -370,8 +396,62 @@ def pessoa_ignorada(box, conf, H, fundo):
     return None
 
 
+# YOLOX-Tiny (Megvii, Apache-2.0, LICENSE-YOLOX), release oficial 0.1.1rc0.
+# Entrada 320x192 (16:9, múltiplo de 32): o quadro 640x360 cabe inteiro, sem
+# espremer. 416x256 vê o mesmo e custa 1,7x.
+YOLOX_ENTRADA = (320, 192)     # largura, altura
+YOLOX_PISO = 0.15              # nada abaixo disso sai do inferir
+YOLOX_NMS = 0.45
+
+
+def _yolox_grade(w, h):
+    """Centro (em células) e passo de cada saída, na ordem do YOLOX: 8, 16, 32."""
+    grades, passos = [], []
+    for s in (8, 16, 32):
+        yv, xv = np.mgrid[0:h // s, 0:w // s]
+        grades.append(np.c_[xv.ravel(), yv.ravel()])
+        passos.append(np.full((xv.size, 1), s))
+    return (np.concatenate(grades).astype(np.float32),
+            np.concatenate(passos).astype(np.float32))
+
+
+YOLOX_GRADE, YOLOX_PASSO = _yolox_grade(*YOLOX_ENTRADA)
+
+
+def inferir_yolox(view):
+    """YOLOX quer BGR 0-255 sem normalizar, com borda 114 à direita e embaixo
+    (letterbox no canto). NMS por classe."""
+    W, H = YOLOX_ENTRADA
+    h, w = view.shape[:2]
+    sc = min(W / w, H / h)
+    nw, nh = int(round(w * sc)), int(round(h * sc))
+    img = np.full((H, W, 3), 114, np.uint8)
+    img[:nh, :nw] = cv2.resize(view, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    net.setInput(cv2.dnn.blobFromImage(img))
+    out = net.forward()[0]                                   # (N, 85)
+    scores = out[:, 4:5] * out[:, 5:]                        # objeto x classe
+    cls = scores.argmax(1)
+    conf = scores[np.arange(len(cls)), cls]
+    m = conf >= YOLOX_PISO
+    if not m.any():
+        return []
+    out, cls, conf = out[m], cls[m], conf[m]
+    xy = (out[:, :2] + YOLOX_GRADE[m]) * YOLOX_PASSO[m]
+    wh = np.exp(out[:, 2:4]) * YOLOX_PASSO[m]
+    caixas = np.c_[xy - wh / 2, xy + wh / 2] / sc            # px do recorte
+    desloc = cls[:, None].astype(np.float32) * 10000         # classes não se cobrem no NMS
+    xywh = np.c_[caixas[:, :2] + desloc, caixas[:, 2:] - caixas[:, :2]]
+    keep = np.array(cv2.dnn.NMSBoxes(xywh.tolist(), conf.tolist(),
+                                     YOLOX_PISO, YOLOX_NMS)).ravel()
+    return [(COCO_CLASSES[cls[i]], float(conf[i]), max(0.0, caixas[i][0]),
+             max(0.0, caixas[i][1]), min(float(w), caixas[i][2]), min(float(h), caixas[i][3]))
+            for i in keep]
+
+
 def inferir(view):
-    """MobileNet-SSD num recorte: [(classe, conf, x1, y1, x2, y2)] em px do recorte."""
+    """Modelo num recorte: [(classe, conf, x1, y1, x2, y2)] em px do recorte."""
+    if YOLOX:
+        return inferir_yolox(view)
     h, w = view.shape[:2]
     blob = cv2.dnn.blobFromImage(cv2.resize(view, (300, 300)),
                                  0.007843, (300, 300), 127.5)
@@ -1822,7 +1902,8 @@ def _selfcheck():
     px = lambda y1, y2: [0, y1 * 360, 100, y2 * 360]
     for y1, y2, c in ((0.02, 0.46, 0.42), (0.11, 0.44, 0.25), (0.21, 0.56, 0.36)):
         assert pessoa_ignorada(px(y1, y2), c, 360, 360) == "longe, na rua"
-    for y1, y2, c in ((0.01, 0.99, 0.25), (0.02, 1.00, 0.39), (0.02, 1.00, 0.53)):
+    for y1, y2, c in ((0.01, 0.99, 0.25), (0.02, 1.00, 0.39),
+                      (0.02, 1.00, PESSOA_ALTA_MIN - 0.01)):
         assert pessoa_ignorada(px(y1, y2), c, 360, 360) == "do topo ao pé, chuva na lente"
     for y1, y2, c in ((0.16, 0.86, 0.35), (0.65, 1.00, 0.27), (0.24, 0.98, 0.31),
                       (0.01, 0.93, 0.56),     # corpo inteiro no portão, outubro
@@ -1887,6 +1968,7 @@ def _selfcheck():
     assert checar_saude(5201)[-1][0] == "Vídeo instável"
     assert checar_saude(5300) == []                                  # no máx. 1/hora
     assert ALAW[0x55] == -8 and ALAW[0xD5] == 8 and ALAW[0x2A] == -32256 and ALAW[0xAA] == 32256
+    assert isinstance(inferir(np.full((360, 640, 3), 90, np.uint8)), list)  # modelo carrega e roda
     assert descartar("pessoa", 0.2, [0, 200, 50, 350], 640, 360, 360) == "abaixo do limiar"
     assert descartar("pessoa", 0.4, [0, 200, 50, 350], 640, 360, 360) is None
     # visitas: um push por visita, mais fotos sem push, visita nova depois de sumir

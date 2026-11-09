@@ -20,6 +20,7 @@ services:
     environment:
       MEDIAMTX_URL: rtsp://127.0.0.1:8554/camera
       DETECT_THREADS: "1"
+      DETECT_MODEL: mobilenet  # o YOLOX-Tiny nao foi medido no Pi 3
       DETECT_INTERVAL_S: "0"   # sem pausa: o nice 10 já protege o vídeo
       VIDEO_FPS: "4"           # metade do custo de conversão, JPEG e envio
       TZ: America/Sao_Paulo    # hora das notificações, das fotos e dos pushes

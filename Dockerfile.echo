@@ -4,7 +4,7 @@
 FROM camera-monitor-deps:arm64
 
 WORKDIR /app
-COPY server.py config.py ptz.py gunicorn.conf.py MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel ./
+COPY server.py config.py ptz.py gunicorn.conf.py yolox_tiny.onnx MobileNetSSD_deploy.prototxt MobileNetSSD_deploy.caffemodel ./
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 8090
