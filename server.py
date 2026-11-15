@@ -59,6 +59,7 @@ APP_PASS = os.environ.get("APP_PASS", "")
 CF_ACCESS_TEAM = os.environ.get("CF_ACCESS_TEAM", "")  # <team>.cloudflareaccess.com
 CF_ACCESS_AUD = os.environ.get("CF_ACCESS_AUD", "")    # Application Audience (AUD) tag
 NTFY_URL = os.environ.get("NTFY_URL", "")  # push no celular: https://ntfy.sh/<tópico-secreto>
+NTFY_TOKEN = os.environ.get("NTFY_TOKEN", "")  # ntfy com login: token de acesso (vazio = sem login)
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "")  # tocar no push abre o ao vivo
 # HLS do MediaMTX com o stream principal (1080p) só copiado, sem decodificar
 # aqui: o modo HD do painel. O docker-entrypoint.sh define; vazio = sem HD.
@@ -74,8 +75,9 @@ EVENTS_MAX = 10                # alertas no painel; todos ficam em /historico
 DETECT_INTERVAL_S = float(os.environ.get("DETECT_INTERVAL_S") or "0.4")
 DETECT_THREADS = int(os.environ.get("DETECT_THREADS") or "0")
 DETECT_NICE = int(os.environ.get("DETECT_NICE") or "10")
-# Quadros/s que o FFmpeg entrega. Cada um custa conversão, JPEG (se alguém
-# assiste) e envio; a detecção usa ~1 a cada 4,5 s no Pi 3 e não sente.
+# Quadros/s que o FFmpeg entrega. Cada um custa a miniatura do movimento e, se
+# alguém assiste, conversão para BGR, JPEG e envio; a detecção usa ~1 a cada
+# 4,5 s no Pi 3 e não sente.
 VIDEO_FPS = int(os.environ.get("VIDEO_FPS") or "8")
 # Só roda o MobileNet quando a cena muda: precisa de uma mancha contínua de
 # mudança com MOTION_BLOB px (miniatura 160x90). Contar pixels soltos não
@@ -344,11 +346,7 @@ def healthz():
     return "ok" if state["connected"] else "aguardando vídeo"
 
 
-def phone_notify(title, msg, jpg=None):
-    """Push via ntfy (app no celular), com a foto anexada. Em thread: rede lenta
-    não pode segurar o loop de captura."""
-    if not NTFY_URL:
-        return
+def ntfy_headers(title, msg, jpg=None):
     headers = {"Title": Header(title, "utf-8").encode(),
                "Message": Header(msg, "utf-8").encode(),
                "Priority": "high", "Tags": "rotating_light"}
@@ -357,6 +355,17 @@ def phone_notify(title, msg, jpg=None):
     if PUBLIC_URL:
         headers["Click"] = PUBLIC_URL
         headers["Actions"] = f"view, Ao vivo, {PUBLIC_URL}"
+    if NTFY_TOKEN:            # ntfy próprio com controle de acesso
+        headers["Authorization"] = f"Bearer {NTFY_TOKEN}"
+    return headers
+
+
+def phone_notify(title, msg, jpg=None):
+    """Push via ntfy (app no celular), com a foto anexada. Em thread: rede lenta
+    não pode segurar o loop de captura."""
+    if not NTFY_URL:
+        return
+    headers = ntfy_headers(title, msg, jpg)
 
     def send():
         try:
@@ -642,7 +651,8 @@ def kill_video(proc=None):
 
 
 def vlc_frames():
-    """Gera frames BGR pelo VLC ou FFmpeg, conforme a plataforma."""
+    """Gera quadros pelo VLC (BGR) ou FFmpeg (I420 cru), conforme a plataforma.
+    Quem precisa de BGR chama bgr()."""
     while True:
         if VIDEO_BACKEND == "vlc" and (FLATPAK_VLC or VLC_EXE):
             vlc_command = FLATPAK_VLC or [VLC_EXE]
@@ -653,8 +663,14 @@ def vlc_frames():
         else:
             # Quadros crus (YUV4MPEG): sem codificar JPEG no FFmpeg só para o
             # Python decodificar de volta. O cabeçalho traz a resolução.
+            # Hora de chegada no lugar do relógio da câmera: a da Echo pula o
+            # relógio dos quadros a cada 35 min 47 s (2^31 us) e o fps=8
+            # despejava ~600 quadros repetidos/s até o watchdog matar o FFmpeg
+            # (~20 s de CPU e o vídeo parado a cada vez). Sem quadro B no
+            # stream, a ordem não muda; medido: 8,01 quadros/s atravessando o salto.
             src = MEDIAMTX_URL if VIDEO_BACKEND == "mediamtx" else RTSP_URL
             command = [FFMPEG_EXE, "-hide_banner", "-loglevel", "error",
+                       "-use_wallclock_as_timestamps", "1",
                        "-rtsp_transport", "tcp", "-i", src, "-map", "0:v:0", "-an",
                        "-vf", f"fps={VIDEO_FPS}", "-pix_fmt", "yuv420p",
                        "-f", "yuv4mpegpipe", "pipe:1"]
@@ -689,8 +705,7 @@ def vlc_frames():
         try:
             while (frame := newest.get()) is not None:
                 state["connected"] = True
-                yield frame if frame.ndim == 3 else cv2.cvtColor(
-                    frame, cv2.COLOR_YUV2BGR_I420)
+                yield frame
         finally:
             kill_video(proc)
         state["connected"] = False
@@ -757,7 +772,7 @@ def put_newest(q, item):
 
 def y4m_frames(stream):
     """Quadros I420 crus (h*3/2 x w) de um fluxo YUV4MPEG2; a conversão para BGR
-    fica para quem consome, só nos quadros que não forem descartados."""
+    fica para quem consome (bgr()), só nos quadros que alguém usa."""
     header = stream.readline()
     if not header.startswith(b"YUV4MPEG2"):
         return
@@ -769,6 +784,21 @@ def y4m_frames(stream):
         if len(data) < size:
             return
         yield np.frombuffer(data, np.uint8).reshape(h * 3 // 2, w)
+
+
+def bgr(frame):
+    """Quadro em BGR. O do FFmpeg chega em I420 cru e só é convertido aqui,
+    quando alguém usa: sem ninguém assistindo, só o quadro que vai para o
+    modelo (2,5 ms por quadro 640x360 na Echo, 8 por segundo antes)."""
+    if frame is None or frame.ndim == 3:
+        return frame
+    return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_I420)
+
+
+def tamanho(frame):
+    """(largura, altura) do quadro, BGR ou I420 cru (h*3/2 linhas)."""
+    h, w = frame.shape[:2]
+    return w, h if frame.ndim == 3 else h * 2 // 3
 
 
 detect_slot = {"frame": None, "ts": 0.0, "dets": [], "dets_ts": 0.0}
@@ -823,9 +853,33 @@ def save_events(fired, frame, ts, dets):
             painel_adiciona(ev)
 
 
+def _cinza_do_y():
+    """Tabela Y -> cinza igual a I420 -> BGR -> BGR2GRAY do próprio OpenCV.
+    No BT.601 de faixa de TV os termos de cor se cancelam no cinza (0,299 x
+    1,596 = 0,587 x 0,813): o cinza só depende do Y, ~255/219 x (Y - 16)."""
+    y = np.repeat(np.arange(256, dtype=np.uint8), 2)            # 2x2 por valor
+    i420 = np.vstack([y, y, np.full(512, 128, np.uint8)])       # Y 2x512, U e V 1x256
+    cinza = cv2.cvtColor(cv2.cvtColor(i420, cv2.COLOR_YUV2BGR_I420), cv2.COLOR_BGR2GRAY)
+    return np.ascontiguousarray(cinza[0, ::2])
+
+
+# Miniatura do movimento direto do Y, sem converter o quadro inteiro para BGR.
+# Difere do caminho por BGR em no máximo 1-2 níveis (arredondamento), contra o
+# limiar de 20 do moved().
+CINZA_DO_Y = _cinza_do_y()
+
+
 def motion_thumb(frame):
-    small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
-    return cv2.GaussianBlur(cv2.cvtColor(small, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    if frame.ndim == 2:   # I420 cru: o cinza sai do Y (as primeiras 2/3 das linhas)
+        # Fora de 16-235 o cinza satura (grade preta, céu): limita antes de
+        # tirar a média, e a tabela vai só na miniatura. Na Echo: 0,9 ms, contra
+        # 1,8 ms com a tabela no quadro inteiro e 2,5 + 1,2 ms por BGR.
+        y = cv2.min(cv2.max(frame[:frame.shape[0] * 2 // 3], 16), 235)
+        small = cv2.LUT(cv2.resize(y, (160, 90), interpolation=cv2.INTER_AREA), CINZA_DO_Y)
+    else:
+        small = cv2.cvtColor(cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA),
+                             cv2.COLOR_BGR2GRAY)
+    return cv2.GaussianBlur(small, (5, 5), 0)
 
 
 def moved(ref, thumb):
@@ -857,6 +911,7 @@ def detect_loop():
         if not moved(ref, thumb) and time.time() - last_run < MOTION_IDLE_S:
             continue  # cena parada: não gasta o MobileNet
         ref, last_run = thumb, time.time()
+        frame = bgr(frame)
         todas = detect(frame)
         # Veículo segue outro caminho: parado é justamente o que interessa (o
         # drop_static o descartaria).
@@ -929,16 +984,19 @@ def capture_loop():
     for frame in vlc_frames():
         saude["ultimo_quadro"] = time.time()
         with lock:
-            detect_slot["frame"] = frame.copy()  # o desenho abaixo não vaza pro detector
+            detect_slot["frame"] = frame   # ninguém escreve nele: o desenho vai numa cópia
             detect_slot["ts"] = time.time()
             dets = detect_slot["dets"]
         detect_ready.set()
         if not state["espectadores"]:
             with lock:
                 state["detections"] = dets
-            continue  # ninguém vendo: sem desenho nem JPEG (a foto do alerta sai do detect_loop)
-        draw_dets(frame, dets)
-        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            continue  # ninguém vendo: sem BGR, desenho nem JPEG (a foto do alerta sai do detect_loop)
+        tela = bgr(frame)
+        if tela is frame:                  # o VLC já entrega BGR: o desenho não vaza pro detector
+            tela = frame.copy()
+        draw_dets(tela, dets)
+        ok, jpg = cv2.imencode(".jpg", tela, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if ok:
             with lock:
                 state["jpeg"] = jpg.tobytes()
@@ -1248,7 +1306,7 @@ def status():
                        detections=state["detections"],
                        # para o modo HD desenhar as caixas no instante certo
                        det_ts=detect_slot["dets_ts"],
-                       quadro=frame.shape[1::-1] if frame is not None else None,
+                       quadro=tamanho(frame) if frame is not None else None,
                        events=list(state["events"]),
                        push=push_ligado(), hd=bool(HLS_URL))
 
@@ -1342,7 +1400,7 @@ def ptz_ir(nome):
             frame = detect_slot["frame"]
         if ref is None or frame is None or ptz_state["indo"] is not eu:
             break
-        ex, ey, conf = falta_andar(ref.astype(np.float32), miniatura(frame))
+        ex, ey, conf = falta_andar(ref.astype(np.float32), miniatura(bgr(frame)))
         if conf < 0.05:        # cena mudou demais (noite, chuva): fica na conta
             break
         ptz_state["pos"] = [alvo["pos"][0] - ex, alvo["pos"][1] - ey]  # recalibra
@@ -1396,7 +1454,7 @@ def posicao(nome):
         return "sem vídeo", 503
     img = hashlib.sha1(nome.encode()).hexdigest()[:12] + ".png"
     os.makedirs(PRESETS_DIR, exist_ok=True)
-    cv2.imwrite(os.path.join(PRESETS_DIR, img), miniatura(frame).astype(np.uint8))
+    cv2.imwrite(os.path.join(PRESETS_DIR, img), miniatura(bgr(frame)).astype(np.uint8))
     ptz_state["presets"][nome] = {"pos": list(ptz_state["pos"]), "img": img}
     ptz_salvar()
     return "ok"
@@ -1949,6 +2007,17 @@ def _selfcheck():
     for y, x in np.random.default_rng(2).integers(0, (356, 636), (300, 2)):
         chuva[y:y + 4, x:x + 2] = 250                                # pingos espalhados
     assert not moved(motion_thumb(still), motion_thumb(chuva))
+    # I420 cru do FFmpeg: a miniatura sai do Y e bate com a do quadro convertido
+    cor = cv2.GaussianBlur(np.random.default_rng(3).integers(0, 256, (360, 640, 3), np.uint8),
+                           (0, 0), 4)                                # cena colorida
+    for f in (still, walk, chuva, cor):
+        yuv = cv2.cvtColor(f, cv2.COLOR_BGR2YUV_I420)
+        assert tamanho(yuv) == (640, 360) and bgr(yuv).shape == f.shape
+        assert cv2.absdiff(motion_thumb(yuv), motion_thumb(bgr(yuv))).max() <= 2
+    i420 = lambda f: cv2.cvtColor(f, cv2.COLOR_BGR2YUV_I420)
+    assert moved(motion_thumb(i420(still)), motion_thumb(i420(walk)))
+    assert not moved(motion_thumb(i420(still)), motion_thumb(i420(chuva)))
+    assert bgr(still) is still and tamanho(still) == (640, 360) and bgr(None) is None
     big = np.random.default_rng(1).random((400, 700)).astype(np.float32)
     big = cv2.GaussianBlur(big, (0, 0), 3)
     ref = big[50:230, 100:420]                                       # posição salva
@@ -2014,6 +2083,14 @@ def _selfcheck():
     assert not heartbeat_devido(20000)
     saude.update(sem_video=False, ultimo_ping=0.0)
     HEARTBEAT_URL = url_antes
+    # ntfy: token só quando definido (ntfy.sh público segue sem login)
+    global NTFY_TOKEN
+    token_antes, NTFY_TOKEN = NTFY_TOKEN, ""
+    cab = ntfy_headers("Teste", "msg", b"jpg")
+    assert "Authorization" not in cab and cab["Filename"] == "foto.jpg"
+    NTFY_TOKEN = "tk_teste"
+    assert ntfy_headers("Teste", "msg")["Authorization"] == "Bearer tk_teste"
+    NTFY_TOKEN = token_antes
     # CSRF: o que muda algo só vale pedido da própria página (ou de curl)
     for metodo, cab, caminho, recusa in (
             ("POST", {"Sec-Fetch-Site": "cross-site"}, "/ptz/esquerda", True),

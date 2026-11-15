@@ -92,6 +92,7 @@ Variaveis opcionais:
 | --- | --- | --- |
 | `CAM_AUDIO_PATH` | vazio | Caminho da camera de onde puxar o audio, quando `CAM_PATH` nao tem audio (ex.: `onvif2` + `onvif1`) |
 | `NTFY_URL` | vazio | Topico ntfy para push no celular. Vazio desliga o push |
+| `NTFY_TOKEN` | vazio | Token de acesso do ntfy (`tk_...`), para servidor proprio com login; vai como `Authorization: Bearer`. Vazio manda sem login (ntfy.sh publico) |
 | `PAINEL_LOCAL` | vazio | Onde o monitor roda, no titulo do painel. Os composes da Echo e do Pi ja definem (`Echo Show`, `Raspberry Pi`) |
 | `PUBLIC_URL` | vazio | Endereco publico do painel; tocar na notificacao abre o ao vivo |
 | `DETECT_THREADS` | `0` (todas) | Threads do OpenCV na deteccao |
@@ -280,6 +281,19 @@ O que muda em relacao ao Pi:
   real) e deteccao com 1 thread a cada 0,3 s: com 2 threads o worker do OpenCV
   fica em nice 0 e o video chegou a congelar. `DETECT_TILES=1` multiplica a
   analise por ~13.
+  Para onde vai a CPU (2026-11-15, % de um nucleo, de dia): o FFmpeg
+  decodificando o H.265 640x360 a 15 fps ~10%; o YOLOX ~10% (0,79 s por
+  analise; com a cena parada, uma a cada 10 s); o MJPEG do painel ~7,5%, so
+  enquanto alguem assiste; o MediaMTX ~1%. Sem ninguem assistindo, o quadro do
+  FFmpeg fica em I420 cru: o filtro de movimento sai do Y e so o quadro que vai
+  para o YOLOX vira BGR (antes eram 8 conversoes por segundo; o caminho por
+  quadro caiu de 3,9% para 1,5% de um nucleo).
+- **Relogio da camera.** A camera pula o relogio dos quadros a cada 35 min
+  47 s (2^31 us). Com esse relogio, o `fps=8` do FFmpeg despejava ~600 quadros
+  repetidos por segundo ate o watchdog derruba-lo (~20 s de CPU e o video
+  parado a cada vez). O FFmpeg usa a hora de chegada dos quadros
+  (`-use_wallclock_as_timestamps`): o stream nao tem quadro B, entao a ordem
+  e a mesma, e o video atravessa o salto a 8 quadros/s.
 - **Persistencia.** `restart: unless-stopped` e o dockerd subindo pelo
   supervisor do techo5 trazem os containers de volta depois de reiniciar a
   Echo. Fotos e historico (`fotos/eventos.jsonl`, com a caixa e a confianca de cada alerta) ficam em
@@ -359,6 +373,11 @@ era um push a cada 20 s: na Echo, uma pessoa 12 min no portao mandou 35.
 
 Quem souber o nome do topico recebe as fotos: trate-o como senha. O push leva
 uma foto, nao video; o ao vivo e o link.
+
+Com um ntfy proprio que exige login, use a URL dele em `NTFY_URL` (na Echo,
+pela rede do Docker: `http://ntfy:8080/<topico>`) e um token com permissao
+de escrita no topico em `NTFY_TOKEN`. O servidor precisa aceitar anexos
+(`attachment-cache-dir`), senao o push com foto e recusado.
 
 ### Modo em casa
 
